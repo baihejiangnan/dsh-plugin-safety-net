@@ -1,0 +1,29 @@
+{
+  "name": "dsh-plugin-safety-net",
+  "version": "0.1.0",
+  "description": "Unified DSH plugin safety net with guarded installs, Web plugin management, and deep health checks.",
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/baihejiangnan/dsh-plugin-safety-net.git"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "dsh-plugin-guard": "github:lxzy-7/dsh-plugin-guard",
+    "dsh-plugin-healthcheck": "github:chenw2759-wq/dsh-plugin-healthcheck",
+    "dsh-web-plugin-manager": "github:LX2000WASD/dsh-web-plugin-manager"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

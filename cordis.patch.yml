@@ -1,0 +1,15 @@
+# dsh-plugin-safety-net keeps each upstream plugin in its own service scope.
+# Their browser panels are discovered from their own dsh.client manifests.
+- insert:
+    - id: safety-net-guard
+      name: 'dsh-plugin-guard'
+    - id: safety-net-manager
+      name: 'dsh-web-plugin-manager'
+      config:
+        profile: 'web'
+    - id: safety-net-healthcheck
+      name: 'dsh-plugin-healthcheck'
+
+# The manager supplies a writable inventory in the same settings surface.
+- id: ui-settings-plugin-inventory
+  disabled: true

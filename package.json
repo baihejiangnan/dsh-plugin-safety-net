@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-safety-net",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Unified DSH plugin safety net with guarded installs, Web plugin management, and deep health checks.",
   "license": "MIT",
   "type": "module",

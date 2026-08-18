@@ -9,13 +9,13 @@ importers:
   .:
     dependencies:
       dsh-plugin-guard:
-        specifier: github:lxzy-7/dsh-plugin-guard#c95036f33a2a10bb4c12d04a7f470747effe6532
+        specifier: https://codeload.github.com/lxzy-7/dsh-plugin-guard/tar.gz/c95036f33a2a10bb4c12d04a7f470747effe6532
         version: https://codeload.github.com/lxzy-7/dsh-plugin-guard/tar.gz/c95036f33a2a10bb4c12d04a7f470747effe6532
       dsh-plugin-healthcheck:
-        specifier: github:chenw2759-wq/dsh-plugin-healthcheck#0d29936305a1649a08625d70066d0c2c3ef1700b
+        specifier: https://codeload.github.com/chenw2759-wq/dsh-plugin-healthcheck/tar.gz/0d29936305a1649a08625d70066d0c2c3ef1700b
         version: https://codeload.github.com/chenw2759-wq/dsh-plugin-healthcheck/tar.gz/0d29936305a1649a08625d70066d0c2c3ef1700b(88da8a2a2c233ccec30f77c42e40aa5b)
       dsh-web-plugin-manager:
-        specifier: github:LX2000WASD/dsh-web-plugin-manager#13fb7a705fb42ba28930f0700269831a665b12d8
+        specifier: https://codeload.github.com/LX2000WASD/dsh-web-plugin-manager/tar.gz/13fb7a705fb42ba28930f0700269831a665b12d8
         version: https://codeload.github.com/LX2000WASD/dsh-web-plugin-manager/tar.gz/13fb7a705fb42ba28930f0700269831a665b12d8(@deepseek-ai/cordis@4.0.1)(@deepseek-ai/dsh-tools@0.1.0-rc.7(38c91eb2d47c5b4ba2c8ead86dfcb4aa))(@deepseek-ai/schemastery@3.18.1)(js-yaml@4.3.1)
 
 packages:
@@ -638,13 +638,13 @@ packages:
     resolution: {integrity: sha512-RWmIqhcFf1lRYBvNmr7qTNuyCt/7/ns2jbpp1+PalgE/rDQcBT0fioSMUpJ93irlUhC5hrg4cYqe6U+0ImW0rA==}
 
   dsh-plugin-guard@https://codeload.github.com/lxzy-7/dsh-plugin-guard/tar.gz/c95036f33a2a10bb4c12d04a7f470747effe6532:
-    resolution: {gitHosted: true, tarball: https://codeload.github.com/lxzy-7/dsh-plugin-guard/tar.gz/c95036f33a2a10bb4c12d04a7f470747effe6532}
+    resolution: {tarball: https://codeload.github.com/lxzy-7/dsh-plugin-guard/tar.gz/c95036f33a2a10bb4c12d04a7f470747effe6532}
     version: 0.3.2
     engines: {node: '>=18'}
     hasBin: true
 
   dsh-plugin-healthcheck@https://codeload.github.com/chenw2759-wq/dsh-plugin-healthcheck/tar.gz/0d29936305a1649a08625d70066d0c2c3ef1700b:
-    resolution: {gitHosted: true, integrity: sha512-xhTfnie/OAd33PHVnFXOk59iEFkrvZInDZD1k/eQkESt3fSMP490znD12zmG4eC5S+4r87IJ5W9nM4R0VSmIiw==, tarball: https://codeload.github.com/chenw2759-wq/dsh-plugin-healthcheck/tar.gz/0d29936305a1649a08625d70066d0c2c3ef1700b}
+    resolution: {integrity: sha512-xhTfnie/OAd33PHVnFXOk59iEFkrvZInDZD1k/eQkESt3fSMP490znD12zmG4eC5S+4r87IJ5W9nM4R0VSmIiw==, tarball: https://codeload.github.com/chenw2759-wq/dsh-plugin-healthcheck/tar.gz/0d29936305a1649a08625d70066d0c2c3ef1700b}
     version: 0.1.0
     peerDependencies:
       '@deepseek-ai/dsh-client-locale': ^0.1.0-rc.6
@@ -654,7 +654,7 @@ packages:
       react: ^18.2.0
 
   dsh-web-plugin-manager@https://codeload.github.com/LX2000WASD/dsh-web-plugin-manager/tar.gz/13fb7a705fb42ba28930f0700269831a665b12d8:
-    resolution: {gitHosted: true, integrity: sha512-WZ9nyu409H//dcu8MAah/zL6GfYgHkl9pCwdzBXu7Z6KzKKr0REUCJRyA6FMeCnBLAll0yDpmbUbdwhHmkHcmQ==, tarball: https://codeload.github.com/LX2000WASD/dsh-web-plugin-manager/tar.gz/13fb7a705fb42ba28930f0700269831a665b12d8}
+    resolution: {integrity: sha512-WZ9nyu409H//dcu8MAah/zL6GfYgHkl9pCwdzBXu7Z6KzKKr0REUCJRyA6FMeCnBLAll0yDpmbUbdwhHmkHcmQ==, tarball: https://codeload.github.com/LX2000WASD/dsh-web-plugin-manager/tar.gz/13fb7a705fb42ba28930f0700269831a665b12d8}
     version: 0.4.6
     hasBin: true
     peerDependencies:

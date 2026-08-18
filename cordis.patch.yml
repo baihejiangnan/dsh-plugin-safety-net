@@ -2,13 +2,13 @@
 # Their browser panels are discovered from their own dsh.client manifests.
 - insert:
     - id: safety-net-guard
-      name: 'dsh-plugin-guard'
+      name: 'dsh-plugin-safety-net/node_modules/dsh-plugin-guard/src/index.js'
     - id: safety-net-manager
-      name: 'dsh-web-plugin-manager'
+      name: 'dsh-plugin-safety-net/node_modules/dsh-web-plugin-manager/dist/index.js'
       config:
         profile: 'web'
     - id: safety-net-healthcheck
-      name: 'dsh-plugin-healthcheck'
+      name: 'dsh-plugin-safety-net/node_modules/dsh-plugin-healthcheck/lib/index.js'
 
 # The manager supplies a writable inventory in the same settings surface.
 - id: ui-settings-plugin-inventory

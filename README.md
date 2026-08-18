@@ -29,10 +29,12 @@ DeepSeek Harness (DSH) Web 插件安全网。一次安装聚合插件管理、�
 ## 安装
 
 ```bash
-dsh plugin --profile web add https://raw.githubusercontent.com/baihejiangnan/dsh-plugin-safety-net/master/dist/dsh-plugin-safety-net-0.1.0.tgz
+dsh plugin --profile web add https://raw.githubusercontent.com/baihejiangnan/dsh-plugin-safety-net/master/dist/dsh-plugin-safety-net-0.1.1.tgz
 ```
 
 请使用上面的发布 tarball。直接使用 `github:baihejiangnan/dsh-plugin-safety-net` 会让包管理器按源码依赖处理，无法保证 bundled dependencies 的安装语义。
+
+`0.1.1` 修复了 DSH Desktop 使用 profile 根目录解析 Bundle 条目时无法找到内嵌子插件的问题。三个子插件仍随单个 tarball 安装，无需单独添加。
 
 安装完成后重启 `dsh web`，然后在设置中使用：
 

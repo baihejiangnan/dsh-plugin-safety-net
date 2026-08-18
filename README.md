@@ -12,6 +12,8 @@ DeepSeek Harness (DSH) Web 插件安全网。一次安装聚合插件管理、�
 | [`LX2000WASD/dsh-web-plugin-manager`](https://github.com/LX2000WASD/dsh-web-plugin-manager) | 插件查看、安装、更新、启停、卸载、市场及基础健康分析 | 插件管理、市场、环境管理 |
 | [`chenw2759-wq/dsh-plugin-healthcheck`](https://github.com/chenw2759-wq/dsh-plugin-healthcheck) | 静态检查、配置组合检查、隔离试跑、恶意代码扫描及修复建议 | 插件检测 |
 
+当前发布版本固定到已审计的上游提交：guard `c95036f`、manager `13fb7a7`、healthcheck `0d29936`。升级上游前应重新测试并更新这些提交。
+
 ## 聚合方式
 
 安全网采用组合 Bundle，而不是复制或改写上游源码：

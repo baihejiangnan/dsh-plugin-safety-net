@@ -1,0 +1,3 @@
+allowBuilds:
+  dsh-web-plugin-manager@https://codeload.github.com/LX2000WASD/dsh-web-plugin-manager/tar.gz/13fb7a705fb42ba28930f0700269831a665b12d8: true
+  dsh-plugin-healthcheck@https://codeload.github.com/chenw2759-wq/dsh-plugin-healthcheck/tar.gz/0d29936305a1649a08625d70066d0c2c3ef1700b: true

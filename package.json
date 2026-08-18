@@ -19,9 +19,9 @@
     }
   },
   "dependencies": {
-    "dsh-plugin-guard": "github:lxzy-7/dsh-plugin-guard",
-    "dsh-plugin-healthcheck": "github:chenw2759-wq/dsh-plugin-healthcheck",
-    "dsh-web-plugin-manager": "github:LX2000WASD/dsh-web-plugin-manager"
+    "dsh-plugin-guard": "github:lxzy-7/dsh-plugin-guard#c95036f33a2a10bb4c12d04a7f470747effe6532",
+    "dsh-plugin-healthcheck": "github:chenw2759-wq/dsh-plugin-healthcheck#0d29936305a1649a08625d70066d0c2c3ef1700b",
+    "dsh-web-plugin-manager": "github:LX2000WASD/dsh-web-plugin-manager#13fb7a705fb42ba28930f0700269831a665b12d8"
   },
   "engines": {
     "node": ">=18"

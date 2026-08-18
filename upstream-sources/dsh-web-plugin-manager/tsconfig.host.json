@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "emitDeclarationOnly": false,
+    "declaration": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "experimentalDecorators": false
+  },
+  "include": ["src/index.ts", "src/analyze.ts", "src/guard.ts", "src/installSession.ts", "src/live.ts", "src/match.ts", "src/net.ts", "src/patch.ts", "src/presets.ts", "src/registry.ts", "src/scan.ts", "src/kinds.ts", "src/tools.ts", "src/types.ts", "src/cli.ts"]
+}

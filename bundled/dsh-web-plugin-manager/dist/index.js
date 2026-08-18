@@ -1,0 +1,4681 @@
+/**
+ * dsh-plugin-manager host service: Web-UI plugin management for a DSH profile.
+ *
+ * Communication with the browser uses a small REST surface registered on
+ * `ctx.webServer` under /api2/plugin-manager/* (the official /api channel is
+ * Typert-owned and requires generated reflection artifacts; a standalone
+ * bundle cannot ship them). Same-origin fetch from the Settings tab.
+ *
+ * Read side merges three truths:
+ *  - the live Loader tree (`ctx.loader.entries()`, like the official
+ *    read-only inventory),
+ *  - the profile manifest (`dsh.profile.bundles` layer stack),
+ *  - the profile's installed dependencies (`package.json`),
+ *  - insert rows in the profile `cordis.patch.yml` (live-mounted non-bundle
+ *    plugins).
+ *
+ * Write side (V2):
+ *  - enable/disable edits the profile's `cordis.patch.yml` through the
+ *    managed-block mechanism (src/patch.ts) — reversible, reviewable, never
+ *    rewrites user content; the change is applied live through the loader
+ *    include (no restart; see src/live.ts for the platform-deadlock rationale);
+ *  - install/remove shells out to the official `dsh plugin` CLI (pnpm +
+ *    reconcile of `dsh.profile.bundles`); after install the real package name
+ *    is resolved from the manifest, and a non-bundle plugin is additionally
+ *    mounted as a managed insert row (config HMR live, no restart);
+ *  - agent tools (plugin_status/install/uninstall/toggle) register on
+ *    ctx.tools when the host provides it (src/tools.ts).
+ */
+import { execFile, execFileSync, spawn } from 'node:child_process';
+import { connect, createServer } from 'node:net';
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { isBuiltin } from 'node:module';
+import { homedir } from 'node:os';
+import { basename, delimiter, dirname, join, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { Context, Service } from '@deepseek-ai/cordis';
+import z from '@deepseek-ai/schemastery';
+import { addDisableBlock, addInsertRow, applyRowDisabled, applyRowEnabled, hasManagedDisable, readInsertRows, readManagedIds, removeDisableBlock, removeInsertRow, writePatch, } from "./patch.js";
+import { analyzeProfile, OFFICIAL_DEP_ALLOWED, scanImports, scanNodeModulesNames, scanPackageImports } from "./analyze.js";
+import { applyLiveOps, ensurePatchWatcher } from "./live.js";
+import { registerPluginGuard, registerPluginRulePrompt } from "./guard.js";
+import { addBlockedRepo, detectRepoType, installPreset, installSkill, isUnderRoot, loadBlockedRepos, loadKindRecords, looksLikeDshPlugin, normalizeRepoRef, presetsDirPath, pruneGhostRecords, removeBlockedRepo, removeKindRecord, renameRetry, rmRetry, saveKindRecord, skillsDirPath, slugDirName, } from "./kinds.js";
+import { agentPresetsOf, archiveOwnedPresets, cleanupOwnedPresets, formatArchiveResult, formatCleanupResult, formatRestoreResult, pluginInstalledInOtherProfiles, restoreArchivedPresets, } from "./presets.js";
+import { marketplaceFetch } from "./net.js";
+import { isGitSourceSpec, updateSpec } from "./match.js";
+import { fetchDshSoIndex, fetchRegistryRepos, fetchSearchFallback, functionalTopics, readRegistryCache, writeRegistryCache, } from "./registry.js";
+import { registerTools } from "./tools.js";
+import { buildFilteredEnv, scanRequirements } from "./scan.js";
+import { createInstallSession, dropInstallSession, filterAnswers, getInstallSession } from "./installSession.js";
+/** Route prefix for the REST surface. */
+export const ROUTE_PREFIX = '/api2/plugin-manager';
+/** This package's own name (identifies the hosting profile). */
+export const OUR_PACKAGE_NAME = (() => {
+    try {
+        const manifest = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8'));
+        return typeof manifest.name === 'string' ? manifest.name : 'dsh-web-plugin-manager';
+    }
+    catch {
+        return 'dsh-web-plugin-manager';
+    }
+})();
+/** Resolve the Harness home directory (DSH_HOME env, then ~/.dsh). */
+function dshHome() {
+    return process.env.DSH_HOME ?? join(homedir(), '.dsh');
+}
+/** The safe-profile-name rule (shared by profileDir and hostProfileName). */
+function isSafeProfileName(name) {
+    // `.` / `..` would escape the profiles root (join(profiles,'..') = dshHome):
+    // removeProfile('..') used to delete the whole Harness home.
+    return /^[A-Za-z0-9._-]+$/.test(name) && name !== '.' && name !== '..' && name.length <= 120;
+}
+/** Resolve one profile's directory, rejecting traversal. */
+function profileDir(name) {
+    if (!isSafeProfileName(name)) {
+        throw new Error("unsafe profile name: " + JSON.stringify(name));
+    }
+    const dir = join(dshHome(), 'profiles', name);
+    // Defense in depth: the resolved path must stay under the profiles root
+    // (a name like `..` would otherwise resolve to the Harness home itself).
+    if (!resolve(dir).startsWith(resolve(join(dshHome(), 'profiles')) + sep)) {
+        throw new Error("unsafe profile name: " + JSON.stringify(name));
+    }
+    return dir;
+}
+/** The profile's package.json manifest, parsed defensively. */
+function readManifest(dir) {
+    const path = join(dir, 'package.json');
+    if (!existsSync(path))
+        return {};
+    try {
+        return JSON.parse(readFileSync(path, 'utf8'));
+    }
+    catch {
+        return {};
+    }
+}
+/** The profile's cordis.patch.yml path (may not exist yet). */
+function patchPath(dir) {
+    return join(dir, 'cordis.patch.yml');
+}
+/** Read patch file content, or the empty string when absent. */
+function readPatch(dir) {
+    const path = patchPath(dir);
+    return existsSync(path) ? readFileSync(path, 'utf8') : '';
+}
+/** Absolute path of `name` on PATH (POSIX walk; no shell involved). */
+function pathLookup(name) {
+    for (const dir of (process.env.PATH ?? '').split(delimiter)) {
+        if (dir.length === 0)
+            continue;
+        const candidate = join(dir, name);
+        try {
+            if (statSync(candidate).isFile()) {
+                accessSync(candidate, constants.X_OK);
+                return candidate;
+            }
+        }
+        catch { /* not executable here: keep walking */ }
+    }
+    return undefined;
+}
+/** Resolve a command to an absolute path (see above for the resolution order). */
+function resolveCommand(name) {
+    if (process.platform !== 'win32') {
+        const nextToNode = join(dirname(process.execPath), name);
+        if (existsSync(nextToNode)) {
+            return { command: nextToNode, dir: dirname(process.execPath) };
+        }
+        const onPath = pathLookup(name);
+        if (onPath !== undefined)
+            return { command: onPath, dir: null };
+        // Any nvm-installed node version's bin dir (the host node may be a copy
+        // outside $NVM_DIR, e.g. launched via an absolute path).
+        const nvmRoot = process.env.NVM_DIR ?? join(homedir(), '.nvm');
+        try {
+            const versions = join(nvmRoot, 'versions', 'node');
+            for (const entry of readdirSync(versions, { withFileTypes: true })) {
+                if (!entry.isDirectory())
+                    continue;
+                const bin = join(versions, entry.name, 'bin');
+                if (existsSync(join(bin, name)))
+                    return { command: join(bin, name), dir: bin };
+            }
+        }
+        catch { /* no nvm layout */ }
+        return { command: name, dir: null };
+    }
+    try {
+        // Console code page 936 (GBK CJK systems) makes `where` emit GBK bytes;
+        // decoding them as UTF-8 mangles non-ASCII usernames into a non-existent
+        // path. Switch the console to UTF-8 first (same chcp pattern as resolveExec).
+        const comspec = process.env.ComSpec ?? process.env.comspec ?? 'cmd.exe';
+        const output = execFileSync(comspec, ['/d', '/s', '/c', 'chcp 65001 >nul & where ' + name], {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+            windowsHide: true,
+        });
+        const hits = output.split(String.fromCharCode(10)).map(line => line.trim()).filter(line => line.length > 0);
+        // npm/nvm shims live as BOTH the bare script and the .cmd wrapper: the
+        // extensionless file cannot be spawned (ENOENT) — prefer an executable
+        // extension, and flag cmd/bat shims so spawns go through a shell.
+        const hit = hits.find(h => h.toLowerCase().endsWith('.exe'))
+            ?? hits.find(h => h.toLowerCase().endsWith('.cmd'))
+            ?? hits.find(h => h.toLowerCase().endsWith('.bat'))
+            ?? hits[0];
+        if (hit !== undefined) {
+            const lower = hit.toLowerCase();
+            const shell = lower.endsWith('.cmd') || lower.endsWith('.bat');
+            return { command: hit, dir: dirname(hit), ...(shell ? { shell: true } : {}) };
+        }
+    }
+    catch { /* not on PATH: let the caller surface the error */ }
+    return { command: name, dir: null };
+}
+/**
+ * Canonical spawn form for a resolved command. Win32 .cmd/.bat shims cannot
+ * be spawned directly (CreateProcess) and must NOT go through spawn's
+ * shell:true either — Node only concatenates args (DEP0190) and the shim's
+ * own quoted lines break under cmd /c re-parsing. Instead spawn cmd.exe
+ * directly with the quoted batch path and quoted args as ONE command-line
+ * argument (the cross-spawn pattern, with windowsVerbatimArguments so Node
+ * passes it through untouched).
+ */
+function resolveExec(tool, args) {
+    if (tool.shell !== true)
+        return { command: tool.command, args, verbatim: false };
+    // cmd /s strips only the first and last quote characters, so the batch
+    // path alone is quoted and arguments are quoted ONLY when they need it
+    // (spaces / cmd specials); bare tokens stay bare (cross-spawn pattern).
+    // A chcp 65001 prefix switches the spawned console to UTF-8 first: on CJK
+    // systems cmd writes error messages in the legacy code page (GBK), which
+    // Node would otherwise misread as UTF-8 mojibake.
+    //
+    // cmd re-parses the command line even INSIDE quotes: `& | < > ^` are
+    // operators and `%` starts variable expansion, so a hostile spec (install
+    // source, package name) could inject extra commands (audit M18). Escape
+    // them (`^` caret prefix; `%` doubled) on every argument before quoting.
+    const escape = (a) => a.replace(/%/g, '%%').replace(/([&|<>^])/g, '^$1');
+    const comspec = process.env.ComSpec ?? process.env.comspec ?? 'cmd.exe';
+    const quotedArgs = args.length > 0
+        ? ' ' + args.map(a => /[\s&|<>^%()]/.test(a) ? '"' + escape(String(a)).replace(/"/g, '""') + '"' : escape(String(a))).join(' ')
+        : '';
+    return {
+        command: comspec,
+        args: ['/d', '/s', '/c', 'chcp 65001 >nul & "' + tool.command + '"' + quotedArgs],
+        verbatim: true,
+    };
+}
+/** Child env with directories prepended to PATH (null dir → base env). */
+function commandEnv(dir, base) {
+    if (dir === null && process.platform !== 'win32')
+        return base ?? process.env;
+    const env = { ...(base ?? process.env) };
+    const parts = [];
+    // Win32: spawned .cmd shims resolve node through PATH, but the host
+    // process may run under a different environment than the user's shell
+    // (nvm-activated terminal): inject the host node's directory so shims
+    // always find node.
+    if (process.platform === 'win32')
+        parts.push(dirname(process.execPath));
+    if (dir !== null)
+        parts.push(dir);
+    // Windows env blocks name the key `Path` (Explorer-started processes) and a
+    // plain-object spread keeps that casing — reading only env.PATH would drop
+    // System32 etc. and break every spawned .cmd shim (chcp not recognized).
+    const path = env.PATH ?? env.Path ?? env.path ?? '';
+    delete env.Path;
+    delete env.path;
+    env.PATH = [...parts, path].filter(p => p.length > 0).join(delimiter);
+    return env;
+}
+/** Run `dsh plugin --profile <name> <verb> <args...>` and collect output. */
+function runDshPlugin(profile, verb, args, cwd, env) {
+    return new Promise((resolve) => {
+        const tool = resolveCommand('dsh');
+        const exec = resolveExec(tool, ['plugin', '--profile', profile, verb, ...args]);
+        execFile(exec.command, exec.args, { cwd, timeout: 10 * 60 * 1000, maxBuffer: 4 * 1024 * 1024, env: commandEnv(tool.dir, env), ...(exec.verbatim ? { windowsVerbatimArguments: true } : {}) }, (error, stdout, stderr) => {
+            const output = [stdout, stderr].filter(Boolean).join('\n');
+            if (error === null) {
+                resolve({ ok: true, exitCode: 0, output });
+            }
+            else {
+                const code = typeof error.code === 'number' ? error.code : null;
+                if (code === null && error.code === 'ENOENT') {
+                    resolve({
+                        ok: false,
+                        exitCode: null,
+                        output: '[plugin-manager] could not start the dsh CLI (' + error.message + '). '
+                            + 'Install it if missing (npm i -g dsh), or start this profile from a shell where node/npm/dsh are on PATH '
+                            + '(nvm: run the profile from an nvm-active terminal, e.g. after `nvm use`).',
+                    });
+                }
+                else {
+                    resolve({ ok: code === 0, exitCode: code, output });
+                }
+            }
+        });
+    });
+}
+/** Management service (also registered as ctx.pluginManager for host peers). */
+export class PluginManagerService extends Service {
+    static inject = ['loader'];
+    constructor(ctx) {
+        super(ctx, 'pluginManager');
+    }
+    /** List every profile under $DSH_HOME/profiles (directories with package.json). */
+    listProfiles() {
+        const root = join(dshHome(), 'profiles');
+        const runs = scanRuns();
+        const out = [];
+        for (const entry of readdirSafe(root)) {
+            if (!entry.isDirectory() || entry.name === 'node_modules')
+                continue;
+            const dir = join(root, entry.name);
+            const manifest = readManifest(dir);
+            const dsh = (manifest['dsh'] ?? {});
+            const profile = (dsh['profile'] ?? {});
+            const bundles = Array.isArray(profile['bundles']) ? profile['bundles'] : [];
+            const dependencies = manifest['dependencies'];
+            out.push({
+                name: entry.name,
+                path: dir,
+                bundles,
+                dependencies: Object.keys(dependencies ?? {}),
+                // The profile hosting this running plugin is its dependency.
+                isCurrent: Object.keys(dependencies ?? {}).includes(OUR_PACKAGE_NAME),
+                isOfficial: isOfficialProfile(entry.name),
+                running: runs.get(entry.name) ?? null,
+            });
+        }
+        return out.sort((a, b) => a.name.localeCompare(b.name));
+    }
+    /** Create a custom profile from an official template (web/headless). */
+    async createProfile(name, template) {
+        if (!/^[A-Za-z0-9._-]+$/.test(name) || name.length > 120) {
+            return { ok: false, message: "invalid profile name: " + JSON.stringify(name) };
+        }
+        if (isOfficialProfile(name))
+            return { ok: false, message: name + " is an official profile" };
+        // Windows device names (CON, NUL, AUX, COM1..9, LPT1..9) and names ending
+        // in a dot/space cannot be directories — reject them up front with a
+        // clear message instead of a raw EINVAL from the filesystem.
+        if (process.platform === 'win32') {
+            const base = name.replace(/\.+$/, '').toUpperCase();
+            if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/.test(base) || /[\s.]$/.test(name)) {
+                return { ok: false, message: name + " is a reserved Windows name; pick another profile name" };
+            }
+        }
+        const dir = profileDir(name);
+        if (existsSync(dir))
+            return { ok: false, message: "profile already exists: " + name };
+        const bundles = template === "headless"
+            ? ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless"]
+            : ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"];
+        try {
+            mkdirSync(dir, { recursive: true });
+            writeFileSync(join(dir, "package.json"), JSON.stringify({
+                name: "dsh-profile-" + name,
+                private: true,
+                dependencies: {},
+                // Template layer stack, official-style (bundles are not deps).
+                dsh: { profile: { bundles } },
+            }, undefined, 2) + "\n");
+            writeFileSync(join(dir, "cordis.patch.yml"), PATCH_TEMPLATE);
+            writeFileSync(join(dir, "pnpm-workspace.yaml"), PNPM_WORKSPACE_TEMPLATE);
+            // Official bundles resolve through the shared profiles/node_modules
+            // fallback (official web/headless have no own node_modules either),
+            // so the template is just the declared layer stack. Custom plugins
+            // install into this profile via pnpm as usual.
+            return { ok: true, message: "created " + template + " profile " + name };
+        }
+        catch (error) {
+            return { ok: false, message: "failed to create profile " + name + " at " + dir + ": " + (error instanceof Error ? error.message : String(error)) };
+        }
+    }
+    /** Rename a custom profile directory (never the hosting profile). */
+    renameProfile(oldName, newName) {
+        if (!/^[A-Za-z0-9._-]+$/.test(newName) || newName.length > 120) {
+            return { ok: false, message: "invalid profile name: " + JSON.stringify(newName) };
+        }
+        if (isOfficialProfile(oldName) || isOfficialProfile(newName)) {
+            return { ok: false, message: "official profiles (web/headless) are not managed here" };
+        }
+        const oldDir = profileDir(oldName);
+        if (!existsSync(oldDir))
+            return { ok: false, message: "profile not found: " + oldName };
+        if (isHostProfile(oldName))
+            return { ok: false, message: "cannot rename the running profile (" + oldName + ")" };
+        const newDir = profileDir(newName);
+        if (existsSync(newDir))
+            return { ok: false, message: "profile already exists: " + newName };
+        try {
+            renameRetry(oldDir, newDir);
+            return { ok: true, message: "renamed " + oldName + " to " + newName };
+        }
+        catch (error) {
+            return { ok: false, message: error instanceof Error ? error.message : String(error) };
+        }
+    }
+    /** Delete a custom profile directory (never the hosting profile). */
+    removeProfile(name) {
+        if (!isSafeProfileName(name))
+            return { ok: false, message: "invalid profile name: " + JSON.stringify(name) };
+        if (isOfficialProfile(name))
+            return { ok: false, message: "official profiles (web/headless) are not managed here" };
+        const dir = profileDir(name);
+        if (!existsSync(dir))
+            return { ok: false, message: "profile not found: " + name };
+        if (isHostProfile(name))
+            return { ok: false, message: "cannot remove the running profile (" + name + ")" };
+        try {
+            rmRetry(dir);
+            return { ok: true, message: "removed profile " + name };
+        }
+        catch (error) {
+            return { ok: false, message: error instanceof Error ? error.message : String(error) };
+        }
+    }
+    /**
+     * Launch a profile instance (web environments only): opens a terminal
+     * window running dsh on a free port (closing the terminal stops the
+     * instance). Falls back to a detached background process when no
+     * terminal emulator is available. Waits until the web server answers.
+     */
+    async startProfile(name) {
+        const dir = profileDir(name);
+        if (!existsSync(dir))
+            return { ok: false, message: "profile not found: " + name };
+        // Refuse a double start: an already-running instance (possibly started
+        // outside this page, e.g. `dsh web` on its default port) must not be
+        // shadowed by a second instance — and stopping either would be ambiguous.
+        const running = scanRuns().get(name);
+        if (running !== undefined) {
+            return {
+                ok: false,
+                message: name + " is already running"
+                    + (running.port !== null ? " on http://127.0.0.1:" + running.port : " (pid " + running.pid + ")")
+                    + " — stop it first",
+            };
+        }
+        const manifest = readManifest(dir);
+        const dsh = (manifest['dsh'] ?? {});
+        const profileManifest = (dsh['profile'] ?? {});
+        const bundles = Array.isArray(profileManifest['bundles']) ? profileManifest['bundles'] : [];
+        if (!bundles.includes('@deepseek-ai/dsh-web-app')) {
+            return { ok: false, message: name + " has no web surface (not a web environment)" };
+        }
+        // Async spawn errors (e.g. the dsh command missing) surface here.
+        let spawnError = null;
+        try {
+            const port = await findFreePort(3090);
+            // Terminal-window mode everywhere: a visible window keeps the instance
+            // in plain sight (the user can see it is alive; closing the window
+            // stops it). Windows shows the same visible cmd window — the flash of
+            // the intermediate `start` launcher is suppressed, and the dsh
+            // shim directory is injected into the window's PATH so its `dsh`
+            // command always resolves (see openInTerminal).
+            const terminal = await openInTerminal('dsh --profile ' + name + ' --port ' + port);
+            if (!terminal.opened) {
+                // No terminal emulator / shell available: background fallback (still
+                // visible via the process scan; the profile list reports it as
+                // running and the stop button manages it).
+                const tool = resolveCommand('dsh');
+                const exec = resolveExec(tool, ['--profile', name, '--port', String(port)]);
+                const child = spawn(exec.command, exec.args, {
+                    cwd: process.cwd(),
+                    detached: true,
+                    stdio: 'ignore',
+                    windowsHide: true,
+                    env: commandEnv(tool.dir),
+                    ...(exec.verbatim ? { windowsVerbatimArguments: true } : {}),
+                });
+                // Swallow async spawn errors (e.g. dsh missing) — reported below.
+                child.on('error', (error) => { spawnError = error.message; });
+                child.unref();
+            }
+            // Wait for the web server to answer (up to ~10s).
+            const deadline = Date.now() + 10_000;
+            for (;;) {
+                if (Date.now() > deadline)
+                    break;
+                if (await probePort(port)) {
+                    return {
+                        ok: true,
+                        port,
+                        url: "http://127.0.0.1:" + port,
+                        message: terminal.opened
+                            ? "opened " + name + " in " + terminal.terminal + " — closing that terminal stops the instance (" + terminal.command + ")"
+                            : "started " + name + " in the background on http://127.0.0.1:" + port + " (stop it from this page)",
+                    };
+                }
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
+            return {
+                ok: false,
+                port,
+                message: spawnError !== null
+                    ? "could not start " + name + ": " + spawnError + " — check that the dsh CLI is installed and the profile process runs in a shell where node/dsh are on PATH (nvm: start it from an nvm-active terminal)"
+                    : "started but did not become ready within 10s: http://127.0.0.1:" + port + " — check the terminal window for errors",
+            };
+        }
+        catch (error) {
+            return { ok: false, message: error instanceof Error ? error.message : String(error) };
+        }
+    }
+    /**
+     * Fetch the marketplace listing (24h cache).
+     *
+     * Sources, in order of value:
+     *   1. the static registry index (topic:dsh-plugin, ~3000 repos, CI-built,
+     *      zero API calls) — fetched through a multi-source fallback chain
+     *      (src/registry.ts) with a local disk cache;
+     *   2. the curated awesome-dsh-plugins catalog (status / packageName /
+     *      curated description) — overlaid onto registry entries, with its
+     *      own-only entries appended;
+     *   3. PLUGINS.md (legacy curated table) — merged into the catalog layer;
+     *   4. GitHub search API — only when every index source is unusable
+     *      (partial by design, never persisted).
+     *
+     * Caching: a 24h disk cache (merged items, profile-independent) plus an
+     * in-process mirror so profile switches (which only recompute installed
+     * flags) never re-read the ~1.7MB file; a 5-minute negative cache records
+     * total source failure; the search fallback never persists. refresh=1 is
+     * the only way to force a network round-trip.
+     *
+     * Installed flags are computed server-side per request for the queried
+     * profile (package-name / repository / git-cache / skills+presets probing),
+     * so "installed" is correct even for plugins installed before the manager.
+     */
+    /**
+     * Marketplace listing. Concurrent refreshes are serialized: the source
+     * walk + cache write is last-write-wins, and parallel walks would let an
+     * older response overwrite a newer one (audit M13).
+     */
+    async marketplace(profile, refresh) {
+        if (refresh) {
+            const previous = marketplaceRefreshTail;
+            let release = () => { };
+            marketplaceRefreshTail = new Promise(resolve => { release = resolve; });
+            await previous;
+            try {
+                return await this.marketplaceInner(profile, true);
+            }
+            finally {
+                release();
+            }
+        }
+        return this.marketplaceInner(profile, false);
+    }
+    async marketplaceInner(profile, refresh) {
+        const cacheDir = join(dshHome(), 'plugin-manager-cache');
+        const cachePath = join(cacheDir, 'marketplace.json');
+        const failurePath = join(cacheDir, 'marketplace-failure.json');
+        mkdirSync(cacheDir, { recursive: true });
+        const readCache = () => {
+            // In-process mirror first: the listing is profile-independent, so
+            // profile switches (flag recomputation) skip the disk read entirely.
+            if (marketplaceMemoryCache !== null && Date.now() - marketplaceMemoryCache.at < MARKETPLACE_TTL) {
+                return {
+                    fetchedAt: new Date(marketplaceMemoryCache.at).toISOString(),
+                    items: marketplaceMemoryCache.items,
+                    source: marketplaceMemoryCache.source,
+                };
+            }
+            try {
+                const cached = JSON.parse(readFileSync(cachePath, 'utf8'));
+                // Cache format changed (item shape / source layout): ignore old files.
+                if (cached.version !== MARKETPLACE_CACHE_VERSION)
+                    return { items: [] };
+                const fetchedAt = typeof cached.fetchedAt === 'string' ? cached.fetchedAt : '';
+                const items = Array.isArray(cached.items) ? cached.items : [];
+                const source = typeof cached.source === 'string' ? cached.source : undefined;
+                return { fetchedAt, items, source };
+            }
+            catch { /* no/ broken cache */ }
+            return { items: [] };
+        };
+        const writeCache = (items, source) => {
+            marketplaceMemoryCache = { at: Date.now(), items, source };
+            // Atomic write (tmp + rename): two concurrent refreshes must not
+            // interleave into a truncated file (audit M13).
+            const tmpPath = cachePath + '.tmp';
+            writeFileSync(tmpPath, JSON.stringify({
+                version: MARKETPLACE_CACHE_VERSION,
+                fetchedAt: new Date().toISOString(),
+                source,
+                items,
+            }, undefined, 2) + '\n');
+            renameSync(tmpPath, cachePath);
+            try {
+                rmSync(tmpPath, { force: true });
+            }
+            catch { /* best-effort */ }
+            // A successful fetch clears the recorded failure reason.
+            rmSync(failurePath, { force: true });
+        };
+        const readFailure = () => {
+            try {
+                const parsed = JSON.parse(readFileSync(failurePath, 'utf8'));
+                return {
+                    fetchedAt: typeof parsed.fetchedAt === 'string' ? parsed.fetchedAt : '',
+                    message: typeof parsed.message === 'string' ? parsed.message : undefined,
+                };
+            }
+            catch { /* no/broken failure record */ }
+            return {};
+        };
+        const writeFailure = (message) => {
+            try {
+                writeFileSync(failurePath, JSON.stringify({ fetchedAt: new Date().toISOString(), message }, undefined, 2) + '\n');
+            }
+            catch { /* failure recording is best-effort */ }
+        };
+        // Serve the cache unless it is missing, stale (>24h), or refresh is forced.
+        const blocked = await loadBlockedRepos();
+        if (!refresh) {
+            const cached = readCache();
+            const fetchedAt = Date.parse(cached.fetchedAt ?? '');
+            if (!Number.isNaN(fetchedAt) && Date.now() - fetchedAt < MARKETPLACE_TTL && cached.items.length > 0) {
+                // The cached listing may predate the dsh.so overlay (or the overlay
+                // fields were dropped by an older cache version) — overlay from the
+                // disk-cached dsh.so index (fast, no network when the TTL holds).
+                const dshSo = await fetchDshSoIndex().catch(() => null);
+                const items = overlayDshSo(cached.items, dshSo);
+                const { items: deduped, dropped } = dedupeMarketplace(await flagMarketplaceItems(filterBlockedRepos(items, blocked), profile));
+                return {
+                    ok: true,
+                    items: deduped,
+                    cachedAt: cached.fetchedAt,
+                    fromCache: true,
+                    message: 'served from cache',
+                    ...(cached.source !== undefined ? { source: cached.source } : {}),
+                    ...(dropped > 0 ? { dropped } : {}),
+                    ...blockedMeta(blocked),
+                    total: deduped.length,
+                };
+            }
+            // Recent total failure: serve the recorded reason instead of re-running
+            // the full GitHub round-trip (the failure is environmental and will
+            // not clear within minutes).
+            const failure = readFailure();
+            const failureAt = Date.parse(failure.fetchedAt ?? '');
+            if (failure.message !== undefined && !Number.isNaN(failureAt)
+                && Date.now() - failureAt < MARKETPLACE_FAILURE_TTL) {
+                return {
+                    ok: false,
+                    items: [],
+                    fromCache: false,
+                    message: failure.message + ' (negative cache — retry automatically in a few minutes)',
+                };
+            }
+        }
+        // Keep previous metadata (stars/dates) for catalog-only entries when the
+        // GitHub API is rate-limited during enrichment.
+        const prior = new Map(readCache().items.map(item => [item.name, item]));
+        let catalogError = null;
+        let markdownError = null;
+        // Fetch sources independently: the registry index, the structured
+        // catalog and the legacy PLUGINS.md complement each other — one failing
+        // must not empty the list.
+        const registryFetch = await fetchRegistryRepos().catch((error) => {
+            console.warn('[plugin-manager] registry index unavailable: ' + (error instanceof Error ? error.message : String(error)));
+            return null;
+        });
+        const registryItems = registryFetch !== null ? registryFetch.repos : null;
+        const registryCacheable = registryFetch !== null && registryFetch.cacheable;
+        const catalogItems = await fetchCatalogItems().catch((error) => {
+            catalogError = error instanceof Error ? error.message : String(error);
+            return [];
+        });
+        const markdownItems = await fetchMarkdownItems().catch((error) => {
+            markdownError = error instanceof Error ? error.message : String(error);
+            return [];
+        });
+        // dsh.so registry: independent verification (L1–L5) + security scan
+        // metadata, overlaid onto matching entries (never an install source).
+        const dshSo = await fetchDshSoIndex().catch((error) => {
+            console.warn('[plugin-manager] dsh.so index unavailable: ' + (error instanceof Error ? error.message : String(error)));
+            return null;
+        });
+        const curated = mergeMarketplace(catalogItems, markdownItems);
+        // Registry base: network index → disk cache → search fallback (partial,
+        // never persisted). The catalog-only path remains when all fail.
+        let base = registryItems;
+        let source = 'registry';
+        if (base === null) {
+            base = readRegistryCache();
+            if (base !== null)
+                source = 'cache';
+            else {
+                base = await fetchSearchFallback();
+                if (base !== null)
+                    source = 'search';
+            }
+        }
+        else if (registryCacheable) {
+            // Only freshness-verified sources persist (audit M14): an unverified
+            // api/raw response must not overwrite a good disk cache.
+            writeRegistryCache(base);
+        }
+        let items;
+        if (base !== null) {
+            items = mergeRegistryWithCurated(base, curated);
+        }
+        else {
+            items = curated;
+            source = 'catalog';
+        }
+        items = overlayDshSo(items, dshSo);
+        // Registry entries already carry stars/dates — only catalog-only entries
+        // (metadata unknown) need GitHub enrichment, so the rate limit is rarely
+        // reached even with a 3000-entry listing.
+        const unknowns = items.filter(item => item.stars === 0 && item.updatedAt.length === 0);
+        if (unknowns.length > 0) {
+            const extras = await enrichRepos(unknowns, prior);
+            const byName = new Map(extras.map(item => [item.name, item]));
+            items = items.map(item => byName.get(item.name) ?? item);
+        }
+        if (items.length > 0) {
+            // Persist only complete listings (registry or catalog); the search
+            // fallback is partial and must not downgrade a good cache.
+            if (source !== 'search')
+                writeCache(items, source);
+            const note = [
+                'registry: ' + (registryItems !== null ? 'ok' : 'unavailable'),
+                catalogError === null ? 'catalog' : 'catalog unavailable (' + catalogError + ')',
+                markdownError === null ? 'PLUGINS.md' : 'PLUGINS.md unavailable (' + markdownError + ')',
+            ].join('; ');
+            const flagged = await flagMarketplaceItems(filterBlockedRepos(items, blocked), profile);
+            const { items: deduped, dropped } = dedupeMarketplace(flagged);
+            return {
+                ok: true,
+                items: deduped,
+                fromCache: false,
+                message: 'fetched ' + deduped.length + ' plugins (' + note + ')',
+                source,
+                ...(dropped > 0 ? { dropped } : {}),
+                ...blockedMeta(blocked),
+                total: deduped.length,
+            };
+        }
+        // Last resort: the on-disk cache (any age — better than an empty list).
+        const cached = readCache();
+        if (cached.items.length > 0) {
+            const dshSo = await fetchDshSoIndex().catch(() => null);
+            const { items: flagged, dropped } = dedupeMarketplace(await flagMarketplaceItems(filterBlockedRepos(overlayDshSo(cached.items, dshSo), blocked), profile));
+            return {
+                ok: true,
+                items: flagged,
+                cachedAt: cached.fetchedAt,
+                fromCache: true,
+                message: 'sources unavailable; served from cache: ' + (catalogError ?? markdownError ?? 'unknown'),
+                ...(cached.source !== undefined ? { source: cached.source } : {}),
+                ...(dropped > 0 ? { dropped } : {}),
+                ...blockedMeta(blocked),
+                total: flagged.length,
+            };
+        }
+        // Total failure with nothing to serve: record the reason so the next
+        // visits within the negative-cache TTL fail fast with a visible message.
+        const failure = catalogError ?? markdownError ?? 'no sources';
+        writeFailure(failure);
+        return { ok: false, items: [], fromCache: false, message: failure };
+    }
+    /** Snapshot one profile: live entries + installed packages + bundle status. */
+    list(profile) {
+        const dir = profileDir(profile);
+        if (!existsSync(dir))
+            throw new Error(`profile not found: ${profile}`);
+        const manifest = readManifest(dir);
+        const dsh = (manifest['dsh'] ?? {});
+        const profileManifest = (dsh['profile'] ?? {});
+        const bundles = (Array.isArray(profileManifest['bundles']) ? profileManifest['bundles'] : []);
+        const deps = (manifest['dependencies'] ?? {});
+        const patch = readPatch(dir);
+        const packages = Object.keys(deps).map((name) => {
+            const isBundle = bundles.includes(name);
+            const source = deps[name];
+            return {
+                name,
+                isBundle,
+                inLayerStack: isBundle,
+                ...readPackageInfo(dir, name),
+                ...(typeof source === 'string' && source.length > 0 ? { source } : {}),
+            };
+        });
+        const insertRows = readInsertRows(patch).map((row) => ({
+            id: row.id,
+            name: row.name,
+            managed: row.managed,
+        }));
+        // Rows the user patch layer explicitly manages (deviate from defaults).
+        const managedIds = readManagedIds(patch);
+        // Stable view: Loader entry ids are random per mount (Math.random
+        // hex), so patch targeting must use the include-tree row id
+        // (EntryOptions.id — stable across reloads; official semantics).
+        // The live loader tree only covers the RUNNING profile: other profiles'
+        // snapshots synthesize their entries from the manifest and insert rows
+        // (offline state — nothing is live until that profile starts).
+        const isRunning = profile === hostProfileName();
+        const entries = isRunning
+            ? includeRows(this.ctx, {
+                packageNames: new Set(packages.map(pkg => pkg.name)),
+                insertNames: new Set(insertRows.map(row => row.name)),
+                insertIds: new Set(insertRows.map(row => row.id)),
+                managedIds,
+            })
+            : offlineEntries(bundles, insertRows);
+        // Installed-but-unmounted dependencies: a manual install through the
+        // official CLI or pnpm writes the dependency but no mount row (the
+        // official CLI only mounts bundle-layer packages), so the plugin is
+        // invisible to the loader and to this view. Synthesize an entry so it
+        // shows up and can be mounted from the UI (mount()).
+        const coveredNames = new Set(entries.map(entry => entry.moduleName));
+        const unmounted = packages
+            .filter(pkg => !pkg.isBundle && !coveredNames.has(pkg.name) && pkg.name !== OUR_PACKAGE_NAME)
+            .map(pkg => ({
+            entryId: slugify(pkg.name),
+            moduleName: pkg.name,
+            enabled: true,
+            fiberPhase: null,
+            installed: true,
+            modified: false,
+            unmounted: true,
+        }));
+        const allEntries = [...entries, ...unmounted];
+        return {
+            profile: {
+                name: profile,
+                path: dir,
+                bundles,
+                dependencies: packages.map(p => p.name),
+                isCurrent: Object.keys(deps).includes(OUR_PACKAGE_NAME),
+                isOfficial: isOfficialProfile(profile),
+                running: scanRuns().get(profile) ?? null,
+            },
+            entries: allEntries,
+            packages,
+            insertRows,
+        };
+    }
+    /**
+     * Mount an installed-but-unmounted dependency as a managed insert row:
+     * the manual-install fix. The official CLI writes only the dependency
+     * (non-bundle plugins get no row, so they never load); this writes the
+     * same managed insert row the install flow would, applied live when the
+     * profile is running.
+     */
+    async mount(profile, packageName) {
+        return enqueueMutation(() => this.mountInner(profile, packageName));
+    }
+    async mountInner(profile, packageName) {
+        const dir = profileDir(profile);
+        if (!existsSync(dir))
+            return { ok: false, message: `profile not found: ` + profile };
+        const manifest = readManifest(dir);
+        const deps = manifest.dependencies ?? {};
+        if (!(packageName in deps)) {
+            return { ok: false, message: packageName + ' is not a profile dependency (install it first)' };
+        }
+        const bundles = readBundles(profile);
+        if (bundles.includes(packageName)) {
+            return { ok: false, message: packageName + ' is a bundle-layer plugin — it loads on restart, no mount row needed' };
+        }
+        const current = readPatch(dir);
+        const rowId = slugify(packageName);
+        // A managed disable block we wrote when this plugin was disabled is not a
+        // user row: drop it first, or readManagedIds misjudges it as user-owned
+        // and re-mounting after a disable dies with id collision.
+        const cleaned = removeDisableBlock(current, rowId);
+        const base = cleaned !== current ? cleaned : current;
+        // Never clobber an existing row (user-written or another plugin's) that
+        // already owns this id — the loader refuses duplicate ids and the whole
+        // tree fails.
+        const existing = readInsertRows(base).find(row => row.id === rowId && row.name !== packageName);
+        const userOwns = readManagedIds(base).has(rowId);
+        if (existing !== undefined || userOwns) {
+            return {
+                ok: false,
+                message: 'row id ' + rowId + ' is already used'
+                    + (existing !== undefined ? ' by ' + existing.name : ' by a user row')
+                    + ' (id collision — mount under a different id or remove the other row)'
+            };
+        }
+        const next = addInsertRow(base, rowId, packageName);
+        if (next === base)
+            return { ok: false, message: packageName + ' is already mounted' };
+        const live = profile === hostProfileName()
+            ? await applyLiveOps(this.ctx, [{ kind: 'append', value: { insert: [{ id: rowId, name: packageName }] } }])
+            : { ok: false, message: 'profile not running' };
+        writePatch(patchPath(dir), next);
+        return {
+            ok: true,
+            message: live.ok
+                ? 'mounted ' + packageName + ' as insert row ' + rowId + ' (applied live)'
+                : 'mounted ' + packageName + ' as insert row ' + rowId + ' (file updated; ' + (live.message ?? 'restart to apply') + ')'
+        };
+    }
+    /** Enable or disable one plugin row via the managed patch block (live). */
+    async setEnabled(profile, entryId, enabled) {
+        return enqueueMutation(() => this.setEnabledInner(profile, entryId, enabled));
+    }
+    async setEnabledInner(profile, entryId, enabled) {
+        const dir = profileDir(profile);
+        if (!existsSync(dir))
+            return { ok: false, message: `profile not found: ${profile}` };
+        // entryId is the include-tree row id (stable). Random-mount ids (8-hex)
+        // cannot be patch-targeted; the UI does not offer toggles for them.
+        if (entryId.includes(':') || !isStableRowId(entryId)) {
+            return { ok: false, message: `not a patch-targetable row id: ${JSON.stringify(entryId)}` };
+        }
+        try {
+            const current = readPatch(dir);
+            // 1. Drop our managed block first (refresh-in-place semantics; the
+            //    line-level edit must not see the block's own row).
+            const withoutBlock = removeDisableBlock(current, entryId);
+            // 2. Line-level edit of a user-written top-level row (the common case:
+            //    the row exists in the profile patch and its disabled field must
+            //    actually change).
+            const rowEdit = enabled
+                ? applyRowEnabled(withoutBlock, entryId)
+                : applyRowDisabled(withoutBlock, entryId);
+            // 3. Compute the live stack mutation, then apply it through the loader
+            //    include BEFORE writing the file. Direct application avoids the
+            //    platform deadlock that a watcher-triggered refresh hits when the
+            //    change unloads a service the HMR service depends on (the timer
+            //    row); the watcher's later refresh of the same content is a no-op.
+            const ops = [];
+            let next = current;
+            if (rowEdit.changed) {
+                next = rowEdit.content;
+                // User-written row edited in place: mirror the edit on the live
+                // stack (drop any stale managed block, then patch the row).
+                ops.push({ kind: 'remove-first', id: entryId, value: { id: entryId, disabled: true } });
+                ops.push({
+                    kind: 'replace-last',
+                    id: entryId,
+                    mutate: (row) => {
+                        const copy = { ...row };
+                        if (enabled) {
+                            delete copy.disabled;
+                            return Object.keys(copy).length > 1 ? copy : null;
+                        }
+                        return { ...copy, disabled: true };
+                    },
+                });
+            }
+            else if (enabled) {
+                // No user row: enabling means the block removal above is the edit.
+                if (withoutBlock !== current)
+                    next = withoutBlock;
+                ops.push({ kind: 'remove-first', id: entryId, value: { id: entryId, disabled: true } });
+            }
+            else {
+                // No user row: fall back to a managed block.
+                const candidate = addDisableBlock(withoutBlock, entryId);
+                if (candidate !== withoutBlock)
+                    next = candidate;
+                ops.push({ kind: 'append', value: { id: entryId, disabled: true } });
+            }
+            // Live application only reaches the running profile's own tree;
+            // other profiles' rows are not mounted here (their patch file is
+            // written and applies on their next start).
+            const live = profile === hostProfileName()
+                ? await applyLiveOps(this.ctx, ops)
+                : { ok: false, message: 'profile not running' };
+            if (next !== current)
+                writePatch(patchPath(dir), next);
+            // Plugin-owned agent presets follow the plugin's liveness: disabling
+            // archives the owned presets (moved out of the picker, zero data loss),
+            // re-enabling restores them. Only the running profile's live toggle
+            // counts — a file-only edit for another profile must not move global
+            // presets (the plugin may still be live there).
+            const presetNote = await this.presetLifecycleNote(profile, entryId, enabled, live.ok);
+            const state = enabled ? 'enabled' : 'disabled';
+            return {
+                ok: true,
+                message: live.ok
+                    ? `${state} ${entryId} (applied live)` + presetNote
+                    : `${state} ${entryId} (file updated; ${live.message ?? 'restart to apply'})`,
+            };
+        }
+        catch (error) {
+            return { ok: false, message: error instanceof Error ? error.message : String(error) };
+        }
+    }
+    /**
+     * Archive (disable) or restore (re-enable) the plugin's owned agent
+     * presets for the running profile, returning a summary suffix for the
+     * result message. Skips when the row's package cannot be resolved, when
+     * another profile still installs the plugin (presets are global), or when
+     * the toggle was file-only. Never throws — a failure degrades to a note.
+     */
+    async presetLifecycleNote(profile, entryId, enabled, liveOk) {
+        if (profile !== hostProfileName() || !liveOk)
+            return '';
+        // Resolve the row's package name: the live tree first (bundle/insert
+        // rows carry a name), then the patch's insert rows (the persistent mount
+        // record — robust against live-tree drift after toggle cycles).
+        const liveName = liveRowStates(this.ctx).find(row => row.entryId === entryId)?.moduleName ?? '';
+        const moduleName = liveName.length > 0
+            ? liveName
+            : readInsertRows(readPatch(profileDir(profile))).find(row => row.id === entryId)?.name ?? '';
+        if (moduleName.length === 0)
+            return '';
+        try {
+            if (enabled) {
+                const result = restoreArchivedPresets(presetsDirPath(), moduleName);
+                const note = formatRestoreResult(moduleName, result);
+                return note.length > 0 ? '\n' + note : '';
+            }
+            if (pluginInstalledInOtherProfiles(profile, moduleName)) {
+                return '\n[plugin-manager] preset archive skipped for ' + moduleName + ': still installed in another profile';
+            }
+            const result = archiveOwnedPresets(presetsDirPath(), moduleName);
+            const note = formatArchiveResult(moduleName, result);
+            return note.length > 0 ? '\n' + note : '';
+        }
+        catch (error) {
+            return '\n[plugin-manager] preset lifecycle failed: ' + (error instanceof Error ? error.message : String(error));
+        }
+    }
+    /** Stop a running instance of a custom profile (never the current one). */
+    async stopProfile(name) {
+        const run = scanRuns().get(name);
+        if (run === undefined)
+            return { ok: false, message: name + ' is not running' };
+        if (isHostProfile(name))
+            return { ok: false, message: 'cannot stop the current instance (' + name + ')' };
+        try {
+            // Kill the real instance first, then its launchers (the terminal-window
+            // cmd/bash that hosts it) — otherwise a stopped instance would leave a
+            // dead window behind and the user would think it is still running.
+            process.kill(run.pid, 'SIGTERM');
+            for (const launcher of run.launchers) {
+                try {
+                    process.kill(launcher, 'SIGTERM');
+                }
+                catch { /* already gone */ }
+            }
+            // Wait for the process to exit (up to ~5s).
+            const deadline = Date.now() + 5_000;
+            for (;;) {
+                if (Date.now() > deadline)
+                    break;
+                await new Promise(resolve => setTimeout(resolve, 400));
+                if (scanRuns().get(name) === undefined) {
+                    return { ok: true, message: 'stopped ' + name };
+                }
+            }
+            return { ok: false, message: 'timed out stopping ' + name };
+        }
+        catch (error) {
+            return { ok: false, message: error instanceof Error ? error.message : String(error) };
+        }
+    }
+    /**
+     * Install a plugin via dsh plugin (preserving in-box bundles). After a
+     * successful add, the real package name is resolved from the manifest
+     * (V2-C: pnpm dependency values may be path/git source strings; the
+     * dependency key is the package name). A non-bundle plugin (no dsh.bundle
+     * declaration) is then mounted as a managed insert row — config HMR applies
+     * it live, no restart.
+     */
+    async install(profile, spec, answers, locale) {
+        return installWithSource(this.ctx, profile, spec, answers, locale);
+    }
+    /**
+     * Copy installed plugins from one profile to another (custom-plugin
+     * transfer). Each package is reinstalled into the target using its
+     * recorded install source (path/git/tarball/name).
+     */
+    async copyPlugins(fromProfile, toProfile, names) {
+        if (!existsSync(profileDir(fromProfile)))
+            return { ok: false, exitCode: 1, output: "source profile not found: " + fromProfile };
+        if (!existsSync(profileDir(toProfile)))
+            return { ok: false, exitCode: 1, output: "target profile not found: " + toProfile };
+        // The whole transfer runs as ONE mutation: installProtected is not
+        // enqueued itself, and a per-package loop outside the mutex would race
+        // with concurrent install/remove/update on the target profile — both
+        // pnpm manifest snapshots and patch rows would be lost (audit C3).
+        return enqueueMutation(async () => {
+            const manifest = readManifest(profileDir(fromProfile));
+            const deps = manifest.dependencies ?? {};
+            const outputs = [];
+            let allOk = true;
+            for (const name of names) {
+                const source = typeof deps[name] === 'string' && deps[name] !== '' ? deps[name] : name;
+                const result = await installProtected(this.ctx, toProfile, source);
+                outputs.push("# " + name + " -> " + toProfile + ": " + (result.ok ? "ok" : "FAILED") + "\n" + result.output.trim());
+                if (!result.ok)
+                    allOk = false;
+            }
+            return {
+                ok: allOk,
+                exitCode: allOk ? 0 : 1,
+                output: outputs.join("\n\n"),
+                installed: [...names],
+            };
+        });
+    }
+    /** Remove an installed package via dsh plugin (preserving in-box bundles). */
+    async remove(profile, name) {
+        return removeProtected(this.ctx, profile, name);
+    }
+    /**
+     * Kind-install overview for the Skills & Presets page: install records
+     * (ghost records pruned) plus the on-disk skill / preset directories
+     * (including non-record installs).
+     */
+    async listKinds() {
+        await pruneGhostRecords();
+        const records = await loadKindRecords();
+        return {
+            records: [...records.entries()].map(([repo, record]) => ({ repo, ...record })),
+            skills: [...dirNameSet(skillsDirPath())].sort(),
+            presets: [...dirNameSet(presetsDirPath())].sort(),
+        };
+    }
+    /**
+     * Export a backup file: install manifests for one profile (or all) plus
+     * the marketplace kind records. A reinstallable LIST, not data/config —
+     * patch user config, node_modules entities, credentials are excluded.
+     */
+    async backupExport(profileFilter) {
+        const profiles = [];
+        const root = join(dshHome(), 'profiles');
+        for (const entry of readdirSafe(root)) {
+            if (!entry.isDirectory() || entry.name === 'node_modules')
+                continue;
+            if (profileFilter.length > 0 && entry.name !== profileFilter)
+                continue;
+            const dir = join(root, entry.name);
+            const manifest = readManifest(dir);
+            const dependencies = manifest.dependencies ?? {};
+            const bundles = manifest.dsh?.profile?.bundles ?? [];
+            if (bundles.length === 0 && Object.keys(dependencies).length === 0)
+                continue;
+            profiles.push({ name: entry.name, bundles, dependencies });
+        }
+        const records = await loadKindRecords();
+        let appVersion = 'unknown';
+        try {
+            const manifest = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8'));
+            if (typeof manifest.version === 'string')
+                appVersion = manifest.version;
+        }
+        catch { /* version is advisory */ }
+        return {
+            app: OUR_PACKAGE_NAME,
+            appVersion,
+            exportedAt: new Date().toISOString(),
+            profiles,
+            kinds: [...records.entries()].map(([repo, record]) => ({ repo, ...record })),
+        };
+    }
+    /**
+     * Diff a backup against the current installation state. Local-path sources
+     * (link:/file:/absolute) that no longer exist are unrestorable, not
+     * missing — reinstalling them would only fail.
+     */
+    async backupDiff(backup, targetProfile) {
+        const missing = [];
+        const already = [];
+        const missingProfiles = [];
+        const unrestorable = [];
+        // Ghost records (dirs deleted externally) would be judged "already
+        // installed" and skip the reinstall — prune first (audit n1).
+        await pruneGhostRecords();
+        // Kind records (global skills/presets).
+        const records = await loadKindRecords();
+        for (const kind of backup.kinds) {
+            if (records.has(kind.repo)) {
+                already.push(kind.repo);
+                continue;
+            }
+            if (!/^[a-z0-9._-]+\/[a-z0-9._-]+$/i.test(kind.repo) || kind.repo.includes('\\') || kind.repo.includes(':')) {
+                // Local-path source: restorable only while the directory still exists
+                // on this machine (a cross-machine restore cannot reach it).
+                if (existsSync(kind.repo)) {
+                    missing.push({ profile: '', name: kind.repo, source: kind.repo, kind: kind.type });
+                }
+                else {
+                    unrestorable.push(kind.repo + ' (local-path source)');
+                }
+                continue;
+            }
+            missing.push({ profile: '', name: kind.repo, source: 'https://github.com/' + kind.repo, kind: kind.type });
+        }
+        // Profile dependencies.
+        for (const bp of backup.profiles) {
+            if (targetProfile.length > 0 && bp.name !== targetProfile)
+                continue;
+            if (!existsSync(profileDir(bp.name))) {
+                missingProfiles.push(bp.name);
+                continue;
+            }
+            const manifest = readManifest(profileDir(bp.name));
+            const deps = manifest.dependencies ?? {};
+            for (const [name, source] of Object.entries(bp.dependencies)) {
+                if (deps[name] !== undefined) {
+                    already.push(bp.name + '/' + name);
+                    continue;
+                }
+                if (/^(link|file):/.test(source) || source.startsWith('/')) {
+                    const localPath = source.replace(/^(link|file):/, '');
+                    if (!existsSync(localPath)) {
+                        unrestorable.push(bp.name + '/' + name + ' (local source gone: ' + localPath + ')');
+                        continue;
+                    }
+                }
+                missing.push({ profile: bp.name, name, source, kind: 'cordis-plugin' });
+            }
+        }
+        return { ok: true, missing, already, missingProfiles, unrestorable };
+    }
+    /**
+     * Restore a backup: reinstall every missing entry through the protected
+     * install chain (quality gate + rollback apply). Failures do not abort the
+     * batch — each entry is reported, and the overall result is failed when
+     * any entry failed. Serialized by the mutation mutex (installWithSource).
+     */
+    async backupRestore(backup, targetProfile) {
+        const diff = await this.backupDiff(backup, targetProfile);
+        if (diff.missing.length === 0) {
+            return {
+                ok: diff.unrestorable.length === 0,
+                exitCode: diff.unrestorable.length === 0 ? 0 : 1,
+                output: 'nothing to restore'
+                    + (diff.unrestorable.length > 0 ? '\nunrestorable:\n  ' + diff.unrestorable.join('\n  ') : ''),
+            };
+        }
+        const outputs = [];
+        let ok = true;
+        for (const entry of diff.missing) {
+            // Kind installs (skill/preset) ignore the profile; cordis goes into it.
+            const profile = entry.kind === 'cordis-plugin' ? entry.profile : (targetProfile.length > 0 ? targetProfile : 'web');
+            try {
+                const result = await installWithSource(this.ctx, profile, entry.source);
+                if (!result.ok && result.awaiting !== undefined) {
+                    // The repository needs install-time env vars the backup cannot
+                    // carry — say exactly which, so the restore is not a dead end
+                    // (audit m4).
+                    outputs.push('[' + entry.name + '] PAUSED: needs environment variable(s) '
+                        + result.awaiting.questions.map(q => q.id).join(', ')
+                        + ' — install it manually from the marketplace/Manage tab and provide them');
+                    ok = false;
+                }
+                else {
+                    outputs.push('[' + entry.name + '] ' + (result.ok ? 'restored' : 'FAILED: ' + result.output.slice(0, 300)));
+                    if (!result.ok)
+                        ok = false;
+                }
+            }
+            catch (error) {
+                outputs.push('[' + entry.name + '] FAILED: ' + (error instanceof Error ? error.message : String(error)));
+                ok = false;
+            }
+        }
+        if (diff.unrestorable.length > 0) {
+            outputs.push('unrestorable:\n  ' + diff.unrestorable.join('\n  '));
+            ok = false;
+        }
+        return { ok, exitCode: ok ? 0 : 1, output: outputs.join('\n') };
+    }
+    /**
+     * Execute one machine-fixable health-check action. A-level actions (safe
+     * defaults) run directly; B-level (conflict disables) are sent here only
+     * after the user confirmed in the UI. Serialized by the mutation mutex;
+     * inner calls use the un-wrapped service methods to avoid queue nesting.
+     */
+    async fixIssue(profile, action, target) {
+        return enqueueMutation(() => this.fixIssueInner(profile, action, target));
+    }
+    async fixIssueInner(profile, action, target) {
+        const dir = profileDir(profile);
+        if (!existsSync(dir))
+            return { ok: false, message: `profile not found: ${profile}` };
+        switch (action) {
+            case 'enable-entry':
+                return this.setEnabledInner(profile, target, true);
+            case 'disable-entry':
+                return this.setEnabledInner(profile, target, false);
+            case 'remove-duplicate-rows': {
+                const current = readPatch(dir);
+                const lines = current.split('\n');
+                // The first matching row is kept; every later `- id: <target>` row is
+                // dropped TOGETHER with its indented children — a line-only filter
+                // left the duplicate's child rows attached to the kept row, producing
+                // duplicate YAML keys / misplaced `disabled` (audit M10).
+                let firstIdx = -1;
+                for (let i = 0; i < lines.length; i += 1) {
+                    const match = /^-\s*id:\s*(\S+)/.exec(lines[i]);
+                    if (match !== null && match[1] === target) {
+                        firstIdx = i;
+                        break;
+                    }
+                }
+                if (firstIdx === -1) {
+                    return { ok: false, message: 'no rows found for id ' + target + ' (re-run the check)' };
+                }
+                const out = [];
+                let dropping = false;
+                for (let i = 0; i < lines.length; i += 1) {
+                    const line = lines[i];
+                    if (i === firstIdx) {
+                        out.push(line);
+                        dropping = false;
+                        continue;
+                    }
+                    const match = /^-\s*id:\s*(\S+)/.exec(line);
+                    if (match !== null && match[1] === target) {
+                        dropping = true;
+                        continue;
+                    }
+                    if (dropping) {
+                        if (/^\s/.test(line))
+                            continue; // duplicate row's indented children
+                        dropping = false;
+                    }
+                    out.push(line);
+                }
+                if (out.length === lines.length) {
+                    return { ok: false, message: 'no duplicate rows found for id ' + target + ' (re-run the check)' };
+                }
+                writePatch(patchPath(dir), out.join('\n'));
+                return {
+                    ok: true,
+                    message: 'removed duplicate rows for id ' + target + ' (first kept; applied via the patch watcher, or on next start)',
+                };
+            }
+            case 'remove-official-copy': {
+                if (!target.startsWith('@deepseek-ai/')) {
+                    return { ok: false, message: target + ' is not an official package; refusing to remove it' };
+                }
+                // Only a plain scoped package name may be targeted: `..`/`/` in the
+                // target would escape node_modules through join() (audit M1).
+                if (!/^@deepseek-ai\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(target)) {
+                    return { ok: false, message: target + ' is not a valid package name; refusing to remove it' };
+                }
+                const pkgDir = join(dir, 'node_modules', target);
+                if (!resolve(pkgDir).startsWith(resolve(join(dir, 'node_modules')) + sep)) {
+                    return { ok: false, message: target + ' escapes node_modules; refusing to remove it' };
+                }
+                if (existsSync(pkgDir))
+                    rmSync(pkgDir, { recursive: true, force: true });
+                const manifest = readManifest(dir);
+                if (manifest.dependencies?.[target] !== undefined) {
+                    delete manifest.dependencies[target];
+                    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest, undefined, 2) + '\n');
+                }
+                return { ok: true, message: 'removed duplicate official copy ' + target + ' from the profile (host fallback now resolves it)' };
+            }
+            default:
+                return { ok: false, message: 'unknown fix action: ' + action };
+        }
+    }
+    /**
+     * Run every A-level (safe-default) fix from a fresh analysis. B-level
+     * suggestions are left for the per-issue confirm flow. Serialized by the
+     * mutation mutex.
+     */
+    async fixAll(profile) {
+        return enqueueMutation(async () => {
+            const dir = profileDir(profile);
+            if (!existsSync(dir))
+                return { ok: false, exitCode: 1, output: 'profile not found: ' + profile };
+            const analysis = analyzeProfile(dir, readBundles(profile), readPatch(dir), new Set(), []);
+            const auto = analysis.issues.filter(issue => issue.fix !== undefined && !issue.fix.confirm);
+            if (auto.length === 0)
+                return { ok: true, exitCode: 0, output: 'nothing to auto-fix' };
+            const outputs = [];
+            let ok = true;
+            for (const issue of auto) {
+                const fix = issue.fix;
+                const result = await this.fixIssueInner(profile, fix.action, fix.target);
+                outputs.push('[' + fix.label + '] ' + (result.ok ? 'fixed' : 'FAILED: ' + result.message));
+                if (!result.ok)
+                    ok = false;
+            }
+            return { ok, exitCode: ok ? 0 : 1, output: outputs.join('\n') };
+        });
+    }
+    /**
+     * Uninstall a marketplace-kind install through its record: skills/presets
+     * delete their directories (path-containment guarded), cordis plugins
+     * remove each recorded package through the protected path (dependency +
+     * insert rows), then the record itself is removed.
+     */
+    async uninstallKind(profile, repo) {
+        const key = normalizeRepoRef(repo);
+        if (key === null)
+            return { ok: false, exitCode: 1, output: 'invalid repo: ' + repo };
+        const records = await loadKindRecords();
+        const record = records.get(key);
+        if (record === undefined) {
+            return {
+                ok: false,
+                exitCode: 1,
+                output: 'no install record for ' + key + ' (records cover marketplace-installed plugins/skills/presets;'
+                    + ' manual installs are managed in the Manage tab)',
+            };
+        }
+        const log = [];
+        if (record.type === 'skill' || record.type === 'agent-preset') {
+            const root = record.type === 'skill' ? skillsDirPath() : presetsDirPath();
+            const names = record.names !== null && record.names.length > 0
+                ? record.names
+                : record.name !== null ? [record.name] : [];
+            let removed = 0;
+            // Agent presets: prefer the host roster service — its remove() clears
+            // a settings default that pointed at the preset and keeps standing
+            // sessions intact; a direct rm of a default preset would break every
+            // new session until the default is unset (host-side semantics). The
+            // CLI has no host ctx and falls back to direct removal.
+            const hostService = record.type === 'agent-preset' ? agentPresetsOf(this.ctx) : undefined;
+            try {
+                for (const name of names) {
+                    const target = join(root, name);
+                    if (hostService !== undefined) {
+                        try {
+                            const rows = await hostService.list();
+                            if (rows.some(row => row.id === name)) {
+                                await hostService.remove(name);
+                                log.push('removed ' + target + ' (host)');
+                                removed++;
+                                continue;
+                            }
+                        }
+                        catch { /* host removal failed — fall through to direct removal */ }
+                    }
+                    if (isUnderRoot(target, root) && existsSync(target)) {
+                        rmSync(target, { recursive: true, force: true });
+                        log.push('removed ' + target);
+                        removed++;
+                    }
+                }
+                if (removed === 0 && record.location !== null && record.location !== root && isUnderRoot(record.location, root) && existsSync(record.location)) {
+                    rmSync(record.location, { recursive: true, force: true });
+                    log.push('removed ' + record.location);
+                }
+            }
+            catch (error) {
+                // A locked/busy directory (Windows) must NOT lose the install
+                // record — the state would claim uninstalled while files remain
+                // (audit M6). Keep the record and report the failure.
+                return {
+                    ok: false,
+                    exitCode: 1,
+                    output: 'uninstall failed for ' + key + ' (' + record.type + '): '
+                        + (error instanceof Error ? error.message : String(error))
+                        + (log.length > 0 ? '\n' + log.join('\n') : '')
+                        + '\n[plugin-manager] the install record was kept — re-run after releasing the directory.',
+                };
+            }
+            await removeKindRecord(key);
+            return {
+                ok: true,
+                exitCode: 0,
+                output: 'uninstalled ' + key + ' (' + record.type + ')' + (log.length > 0 ? '\n' + log.join('\n') : ''),
+            };
+        }
+        if (record.type === 'cordis-plugin') {
+            // The record carries the profile the plugin was installed into —
+            // fall back to it when the caller passes none (audit m3).
+            const targetProfile = profile.length > 0 ? profile : (record.profile ?? '');
+            if (targetProfile.length === 0) {
+                return {
+                    ok: false,
+                    exitCode: 1,
+                    output: 'cordis plugin uninstall needs a target profile — use the Manage tab or dshpm uninstall-kind --profile <name>',
+                };
+            }
+            const names = record.names !== null && record.names.length > 0
+                ? record.names
+                : record.name !== null ? [record.name] : [];
+            if (names.length === 0) {
+                return { ok: false, exitCode: 1, output: 'install record for ' + key + ' has no package names' };
+            }
+            const outputs = [];
+            let ok = true;
+            for (const name of names) {
+                const result = await removeProtected(this.ctx, targetProfile, name);
+                outputs.push(result.output);
+                if (!result.ok)
+                    ok = false;
+            }
+            if (!ok) {
+                // A failed package removal must keep the record — the package is
+                // still installed (audit M6).
+                return {
+                    ok: false,
+                    exitCode: 1,
+                    output: outputs.join('\n\n')
+                        + '\n[plugin-manager] uninstall incomplete — the install record was kept; re-run after fixing the failures.',
+                };
+            }
+            await removeKindRecord(key);
+            return { ok, exitCode: ok ? 0 : 1, output: outputs.join('\n\n') };
+        }
+        // instructions / unknown kinds: record cleanup only
+        await removeKindRecord(key);
+        return { ok: true, exitCode: 0, output: 'removed install record for ' + key };
+    }
+    /** Remove one managed insert row (non-bundle plugin, live unmount). */
+    async removeInsert(profile, rowId) {
+        return enqueueMutation(() => this.removeInsertInner(profile, rowId));
+    }
+    async removeInsertInner(profile, rowId) {
+        const dir = profileDir(profile);
+        if (!existsSync(dir))
+            return { ok: false, message: `profile not found: ${profile}` };
+        try {
+            const current = readPatch(dir);
+            const rows = readInsertRows(current);
+            const row = rows.find(r => r.id === rowId);
+            if (row === undefined)
+                return { ok: false, message: `insert row not found: ${rowId}` };
+            if (!row.managed)
+                return { ok: false, message: `row ${rowId} is user-owned; remove it manually` };
+            const { content, removed } = removeInsertRow(current, rowId);
+            if (!removed)
+                return { ok: false, message: `no managed insert row: ${rowId}` };
+            // Live-unmount through the loader include before persisting the
+            // file (running profile only; other profiles apply on next start).
+            const live = profile === hostProfileName()
+                ? await applyLiveOps(this.ctx, [{
+                        kind: 'remove-first',
+                        value: { insert: [{ id: rowId, name: row.name }] },
+                    }])
+                : { ok: false, message: 'profile not running' };
+            writePatch(patchPath(dir), content);
+            return {
+                ok: true,
+                message: live.ok
+                    ? `removed insert row ${rowId} (applied live)`
+                    : `removed insert row ${rowId} (file updated; ${live.message ?? 'restart to apply'})`,
+            };
+        }
+        catch (error) {
+            return { ok: false, message: error instanceof Error ? error.message : String(error) };
+        }
+    }
+    /**
+     * Check every installed package for a newer version (manual update check).
+     *
+     * Source kinds:
+     *  - npm packages (semver range / bare version in the manifest) are
+     *    compared against the npm registry dist-tag `latest`;
+     *  - git-cloned cache directories (dependencies value `link:<path>` where
+     *    the target is a git repository) are compared against their remote:
+     *    the cache is fetched (never pulled) and the local HEAD is compared
+     *    with the remote ref;
+     *  - anything else (local non-git directories, tarballs, unknown shapes)
+     *    reports `hasUpdate: false` with an explanatory message — a manual
+     *    reinstall is still possible via the update action.
+     */
+    async checkUpdates(profile) {
+        const dir = profileDir(profile);
+        if (!existsSync(dir))
+            return { ok: false, items: [], message: 'profile not found: ' + profile };
+        const manifest = readManifest(dir);
+        const deps = manifest.dependencies ?? {};
+        // Self-update included: updating the running manager is safe — the new
+        // files land on disk while the loaded module keeps running in memory,
+        // and the update path carries the quality gate (rollback re-installs the
+        // previous version, never uninstalls). A restart applies the new code.
+        const names = Object.keys(deps);
+        // Bounded concurrency: npm view / git fetch are child processes.
+        const results = [];
+        let cursor = 0;
+        const workers = Array.from({ length: Math.min(4, names.length) }, async () => {
+            for (;;) {
+                const index = cursor;
+                cursor += 1;
+                if (index >= names.length)
+                    return;
+                const name = names[index];
+                results.push(await checkPackageUpdate(dir, name, deps[name]));
+            }
+        });
+        await Promise.all(workers);
+        const updatable = results.filter(item => item.hasUpdate).length;
+        return {
+            ok: true,
+            items: results.sort((a, b) => a.name.localeCompare(b.name)),
+            message: updatable > 0
+                ? updatable + ' of ' + results.length + ' packages have updates'
+                : 'all ' + results.length + ' packages are up to date',
+        };
+    }
+    /**
+     * Update one installed package to the latest version.
+     *
+     *  - npm: reinstall through the official CLI with `@latest` (quality gate
+     *    and in-box bundle preservation included);
+     *  - git cache (link:path into plugin-manager-src): fetch + hard reset the
+     *    cache to its remote ref, then re-run the official add to refresh the
+     *    dependency record; the installed package links into the cache, so the
+     *    new content is picked up on the next start;
+     *  - git URL sources (`github:…` / git URLs): re-add the source spec so
+     *    pnpm re-resolves the remote;
+     *  - local non-git directories cannot be updated (no upstream to pull).
+     */
+    async update(profile, name, locale) {
+        return updateProtected(profile, name, locale);
+    }
+    /**
+     * Dependency / conflict / compatibility analysis for one profile. The
+     * offline engine (src/analyze.ts) covers any profile; the running profile
+     * additionally feeds live observations: fiber states and errors, the
+     * active service table (ctx.reflect), and pending-inject diagnostics.
+     */
+    analyze(profile) {
+        const dir = profileDir(profile);
+        if (!existsSync(dir))
+            throw new Error(`profile not found: ${profile}`);
+        const manifest = readManifest(dir);
+        const dsh = (manifest['dsh'] ?? {});
+        const profileManifest = (dsh['profile'] ?? {});
+        const bundles = (Array.isArray(profileManifest['bundles']) ? profileManifest['bundles'] : []);
+        const patch = readPatch(dir);
+        const isRunning = profile === hostProfileName();
+        const liveRows = isRunning ? liveRowStates(this.ctx) : [];
+        const disabledNames = new Set(liveRows.filter(row => !row.enabled).map(row => row.moduleName));
+        const extra = [];
+        if (isRunning) {
+            // Failed fibers: surface the underlying error when the runtime keeps it.
+            for (const row of liveRows) {
+                if (row.phase !== 'failed' && row.phase !== 'unloading')
+                    continue;
+                extra.push({
+                    kind: 'load-failure',
+                    from: row.moduleName,
+                    message: row.moduleName + ' (' + row.entryId + ') failed to load'
+                        + (row.error !== undefined ? ': ' + row.error : ''),
+                });
+            }
+            // Pending fibers: compare static inject declarations against the
+            // active service table (a missing provider leaves the entry pending).
+            // ctx.reflect is the public reflection property on every context
+            // (NOT a service — ctx.get('reflect') is undefined). The store is an
+            // internal object keyed by isolate symbols; it is read defensively.
+            const activeServices = new Set();
+            const reflect = this.ctx.reflect;
+            if (reflect?.store !== undefined) {
+                for (const impl of Object.values(reflect.store)) {
+                    if (impl?.fiber?.state === 2 && typeof impl.name === 'string')
+                        activeServices.add(impl.name);
+                }
+            }
+            const analysis = analyzeProfile(dir, bundles, patch, disabledNames, []);
+            for (const pkg of analysis.packages) {
+                if (pkg.injects.length === 0)
+                    continue;
+                const row = liveRows.find(live => live.moduleName === pkg.name);
+                if (row === undefined || row.phase !== 'pending')
+                    continue;
+                const missing = pkg.injects.filter(name => !activeServices.has(name) && name !== 'loader' && name !== 'webServer');
+                if (missing.length > 0) {
+                    extra.push({
+                        kind: 'pending-dependency',
+                        from: pkg.name,
+                        message: pkg.name + ' is pending: it injects ' + missing.join(', ')
+                            + ' but no active service provides it (install or enable the provider, or check its own failure)',
+                    });
+                }
+            }
+        }
+        return analyzeProfile(dir, bundles, patch, disabledNames, extra);
+    }
+}
+/** Run a command with a timeout, resolving (never throwing) with the output. */
+function execFileTimeout(cmd, args, timeoutMs) {
+    return new Promise((resolve) => {
+        const tool = resolveCommand(cmd);
+        const exec = resolveExec(tool, [...args]);
+        execFile(exec.command, exec.args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, windowsHide: true, env: commandEnv(tool.dir), ...(exec.verbatim ? { windowsVerbatimArguments: true } : {}) }, (error, stdout, stderr) => {
+            const output = [stdout, stderr].filter(Boolean).join('\n');
+            if (error === null)
+                resolve({ ok: true, output });
+            else
+                resolve({ ok: false, output });
+        });
+    });
+}
+/** Whether a directory is a git repository (cheap probe). */
+function isGitRepo(path) {
+    try {
+        const tool = resolveCommand('git');
+        const exec = resolveExec(tool, ['-C', path, 'rev-parse', '--git-dir']);
+        execFileSync(exec.command, exec.args, { stdio: 'ignore', timeout: 5_000, windowsHide: true, env: commandEnv(tool.dir), ...(exec.verbatim ? { windowsVerbatimArguments: true } : {}) });
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/** Resolve a `link:`/`file:` dependency value to its target path, or null. */
+function parseLocalSource(source) {
+    const match = /^(?:link|file):(.+)$/.exec(source.trim());
+    return match !== null ? match[1].trim() : null;
+}
+/** Extract a cloneable URL from a git source spec (drops #ref fragments). */
+function gitUrlFromSpec(source) {
+    const spec = source.trim().split('#')[0];
+    if (spec.startsWith('github:'))
+        return 'https://github.com/' + spec.slice(7).replace(/^\.git/, '');
+    if (spec.startsWith('git+'))
+        return spec.slice(4);
+    return spec;
+}
+/** Whether a spec looks like a git clone URL (used by update/checkUpdates). */
+function isGitCloneSpec(source) {
+    const spec = source.trim();
+    return spec.startsWith('file:')
+        || spec.startsWith('git@')
+        || spec.startsWith('github:')
+        || spec.startsWith('git+')
+        || /^https?:\/\//.test(spec);
+}
+/** The installed git commit of a package manifest (gitHead), when recorded. */
+async function installedGitHead(dir, name) {
+    // pnpm never writes gitHead (that is an npm convention): for plugins
+    // installed from the git cache the installed package is a link INTO the
+    // cache clone, so the clone's HEAD IS the installed commit. Read it
+    // directly; fall back to package.json gitHead for npm-style git installs.
+    try {
+        const resolved = realpathSync(join(dir, 'node_modules', name));
+        const cacheRoot = join(dshHome(), 'plugin-manager-src') + sep;
+        if (resolved.startsWith(cacheRoot)) {
+            const head = await execFileTimeout('git', ['-C', resolved, 'rev-parse', 'HEAD'], 10_000);
+            if (head.ok) {
+                const first = head.output.trim().split(/\r?\n/)[0];
+                if (first !== undefined && first.length > 0)
+                    return first;
+            }
+        }
+    }
+    catch { /* not a cache link: fall through to package.json gitHead */ }
+    try {
+        const manifest = JSON.parse(readFileSync(join(dir, 'node_modules', name, 'package.json'), 'utf8'));
+        return typeof manifest.gitHead === 'string' && manifest.gitHead.length > 0 ? manifest.gitHead : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+/** Latest dist-tag version of an npm package, or undefined when unreachable. */
+function npmLatestVersion(name) {
+    return npmRegistryLatest(name);
+}
+/** Remote HEAD commit of a git URL, or undefined when unreachable. */
+async function gitRemoteHead(url) {
+    const result = await execFileTimeout('git', ['ls-remote', url, 'HEAD'], 20_000);
+    if (!result.ok)
+        return undefined;
+    const first = result.output.trim().split(/\r?\n/)[0];
+    return first !== undefined ? first.split(/\s+/)[0] : undefined;
+}
+/**
+ * Fetch a git cache directory (never merging) and compare the local HEAD
+ * with the remote ref (the branch upstream, falling back to FETCH_HEAD).
+ */
+async function gitRemoteState(dir) {
+    const head = await execFileTimeout('git', ['-C', dir, 'rev-parse', 'HEAD'], 10_000);
+    if (!head.ok)
+        return { ok: false, hasUpdate: false, message: 'not a git repository' };
+    const headHash = head.output.trim();
+    if (headHash.length === 0)
+        return { ok: false, hasUpdate: false, message: 'no HEAD commit' };
+    // A CHECK must not mutate a user's own git workspace (audit M12: the old
+    // code ran `git fetch --prune` on any local repo — it deleted remote
+    // tracking refs and wrote into the working tree). Only the manager's own
+    // clone cache (<dshHome>/plugin-manager-src) is fetched; everything else
+    // is compared read-only via ls-remote.
+    const cacheRoot = join(dshHome(), 'plugin-manager-src');
+    const isManagedCache = resolve(dir).startsWith(resolve(cacheRoot) + sep);
+    if (isManagedCache) {
+        const fetched = await execFileTimeout('git', ['-C', dir, 'fetch', '--quiet', '--prune'], 20_000);
+        if (!fetched.ok) {
+            return { ok: false, hasUpdate: false, message: 'git fetch failed: ' + fetched.output.trim().slice(0, 200) };
+        }
+        const upstream = await execFileTimeout('git', ['-C', dir, 'rev-parse', '@{u}'], 10_000);
+        let remoteHash = upstream.ok ? upstream.output.trim() : '';
+        if (remoteHash.length === 0) {
+            const fetchHead = await execFileTimeout('git', ['-C', dir, 'rev-parse', 'FETCH_HEAD'], 10_000);
+            if (fetchHead.ok)
+                remoteHash = fetchHead.output.trim();
+        }
+        if (remoteHash.length === 0)
+            return { ok: false, hasUpdate: false, message: 'no remote ref to compare' };
+        const hasUpdate = remoteHash !== headHash;
+        return {
+            ok: true,
+            hasUpdate,
+            latest: remoteHash.slice(0, 12),
+            message: hasUpdate
+                ? 'remote moved (' + headHash.slice(0, 12) + ' → ' + remoteHash.slice(0, 12) + ')'
+                : 'up to date (' + headHash.slice(0, 12) + ')',
+        };
+    }
+    const branch = await execFileTimeout('git', ['-C', dir, 'rev-parse', '--abbrev-ref', 'HEAD'], 10_000);
+    const branchName = branch.ok ? branch.output.trim() : '';
+    if (branchName.length === 0 || branchName === 'HEAD') {
+        return { ok: false, hasUpdate: false, message: 'detached HEAD — cannot compare' };
+    }
+    const remote = await execFileTimeout('git', ['-C', dir, 'ls-remote', '--heads', 'origin'], 20_000);
+    if (!remote.ok) {
+        // Offline / unreachable: this is NOT "no update" — say so explicitly so
+        // the caller can distinguish a failed check from a fresh one (audit M12).
+        return { ok: false, hasUpdate: false, message: 'cannot reach the remote (' + remote.output.trim().slice(0, 120) + ')' };
+    }
+    let remoteHash = '';
+    for (const line of remote.output.split(/\r?\n/)) {
+        const match = /^([0-9a-f]{40,})\trefs\/heads\/(.+)$/.exec(line.trim());
+        if (match !== null && match[2] === branchName) {
+            remoteHash = match[1];
+            break;
+        }
+    }
+    if (remoteHash.length === 0)
+        return { ok: false, hasUpdate: false, message: 'no remote ref to compare' };
+    const hasUpdate = remoteHash !== headHash;
+    return {
+        ok: true,
+        hasUpdate,
+        latest: remoteHash.slice(0, 12),
+        message: hasUpdate
+            ? 'remote moved (' + headHash.slice(0, 12) + ' → ' + remoteHash.slice(0, 12) + ')'
+            : 'up to date (' + headHash.slice(0, 12) + ')',
+    };
+}
+/** Fetch and hard-reset a git cache directory to its remote branch. */
+async function gitPullToRemote(dir) {
+    const branch = await execFileTimeout('git', ['-C', dir, 'rev-parse', '--abbrev-ref', 'HEAD'], 10_000);
+    const branchName = branch.ok ? branch.output.trim() : '';
+    if (branchName.length === 0 || branchName === 'HEAD') {
+        return { ok: false, message: 'detached HEAD — cannot fast-forward the cache' };
+    }
+    const fetched = await execFileTimeout('git', ['-C', dir, 'fetch', '--quiet', '--prune'], 20_000);
+    if (!fetched.ok)
+        return { ok: false, message: fetched.output.trim().slice(0, 300) };
+    const reset = await execFileTimeout('git', ['-C', dir, 'reset', '--hard', 'origin/' + branchName], 20_000);
+    if (!reset.ok)
+        return { ok: false, message: reset.output.trim().slice(0, 300) };
+    const head = await execFileTimeout('git', ['-C', dir, 'rev-parse', 'HEAD'], 10_000);
+    return { ok: true, message: 'cache reset to ' + (head.ok ? head.output.trim().slice(0, 12) : 'remote') };
+}
+/** Update-check for one installed package (see PluginManagerService.checkUpdates). */
+async function checkPackageUpdate(dir, name, source) {
+    const installed = readPackageInfo(dir, name).version;
+    const local = parseLocalSource(source);
+    if (local !== null) {
+        if (!isGitRepo(local)) {
+            return {
+                name,
+                hasUpdate: false,
+                ...(installed !== undefined ? { currentVersion: installed } : {}),
+                source: 'local',
+                message: 'installed from a local directory — no upstream to compare',
+            };
+        }
+        const git = await gitRemoteState(local);
+        return {
+            name,
+            hasUpdate: git.ok && git.hasUpdate,
+            ...(installed !== undefined ? { currentVersion: installed } : {}),
+            ...(git.latest !== undefined ? { latestVersion: git.latest } : {}),
+            source: 'git',
+            message: git.message,
+        };
+    }
+    if (isGitSourceSpec(source)) {
+        const remote = await gitRemoteHead(gitUrlFromSpec(source));
+        const gitHead = await installedGitHead(dir, name);
+        if (remote === undefined || gitHead === undefined) {
+            return {
+                name,
+                hasUpdate: false,
+                ...(installed !== undefined ? { currentVersion: installed } : {}),
+                source: 'git',
+                message: remote === undefined
+                    ? 'remote unreachable — cannot check'
+                    : 'no recorded install commit — cannot compare (reinstall to refresh)',
+            };
+        }
+        const hasUpdate = remote !== gitHead;
+        return {
+            name,
+            hasUpdate,
+            ...(installed !== undefined ? { currentVersion: installed } : {}),
+            latestVersion: remote.slice(0, 12),
+            source: 'git',
+            message: hasUpdate
+                ? 'remote moved (' + gitHead.slice(0, 12) + ' → ' + remote.slice(0, 12) + ')'
+                : 'up to date (' + gitHead.slice(0, 12) + ')',
+        };
+    }
+    // npm source: compare against the registry dist-tag latest.
+    const latest = await npmLatestVersion(name);
+    if (latest === undefined) {
+        return {
+            name,
+            hasUpdate: false,
+            ...(installed !== undefined ? { currentVersion: installed } : {}),
+            source: 'npm',
+            message: 'registry lookup failed (offline?)',
+        };
+    }
+    // Compare semver-wise: a string compare flags 1.2 vs 1.2.0 as an update
+    // (audit) — compareVersions pads missing segments.
+    const hasUpdate = installed !== undefined && compareVersions(installed, latest) < 0;
+    return {
+        name,
+        hasUpdate,
+        ...(installed !== undefined ? { currentVersion: installed } : {}),
+        latestVersion: latest,
+        source: 'npm',
+        message: installed !== undefined
+            ? 'installed ' + installed + ', latest ' + latest
+            : 'latest ' + latest,
+    };
+}
+/**
+ * Normalize a cloneable git URL into the pnpm git-protocol form
+ * (github:owner/repo for GitHub, the URL itself otherwise), keeping a #ref
+ * fragment. Git-source plugins install INTO the profile tree through this
+ * spec so their dependencies resolve; a link install would put the code in
+ * the clone cache outside the profile, where bare imports cannot reach the
+ * profile/fallback node_modules (ERR_MODULE_NOT_FOUND crash).
+ */
+export function toGitSpec(repo, ref) {
+    const github = /^https?:\/\/github\.com\/([^/]+)\/([^/]+?)\.git$/.exec(repo)
+        ?? /^https?:\/\/github\.com\/([^/]+)\/([^/]+)$/.exec(repo);
+    let spec = github !== null ? 'github:' + github[1] + '/' + github[2] : repo;
+    if (ref !== undefined && ref.length > 0)
+        spec += '#' + ref;
+    return spec;
+}
+/**
+ * The pnpm git-protocol spec for a clone-cache directory, from its origin
+ * remote (github:owner/repo for GitHub remotes, the URL otherwise). Used by
+ * the update path so a cache refresh reinstalls the plugin through the git
+ * protocol instead of re-linking it (a link cannot resolve the plugin's
+ * dependencies — see prepareInstallSource).
+ */
+export async function gitSpecFromCache(local) {
+    const remote = await execFileTimeout('git', ['-C', local, 'remote', 'get-url', 'origin'], 10_000);
+    if (!remote.ok || remote.output.trim().length === 0)
+        return undefined;
+    let url = remote.output.trim();
+    if (url.startsWith('git@github.com:'))
+        url = 'https://github.com/' + url.slice('git@github.com:'.length);
+    return toGitSpec(url);
+}
+/**
+ * The commit a git-protocol dependency currently resolves to, from the
+ * profile lockfile (pnpm records it as the tar.gz URL suffix). Used to roll
+ * a failed git-source update back to the previous commit.
+ */
+export function gitCommitFromLock(profile, packageName) {
+    try {
+        const lock = readFileSync(join(profileDir(profile), 'pnpm-lock.yaml'), 'utf8');
+        for (const line of lock.split('\n')) {
+            // Scoped names appear YAML-quoted:  ' @scope/pkg@https://...tar.gz/<commit>':
+            // the closing quote sits between the commit and the colon.
+            const m = /^ {2}['"]?(.+?)['"]?@(https?:[^\s]+?tar\.gz\/([0-9a-f]{40,}))['"]?:/.exec(line);
+            if (m === null)
+                continue;
+            const key = m[1].replace(/^node_modules\//, '');
+            if (key === packageName || key.endsWith('/' + packageName))
+                return m[3];
+        }
+    }
+    catch { /* no lockfile: no commit to roll back to */ }
+    return undefined;
+}
+/**
+ * Prepare an install source. Git URLs (npm-unpublished repositories,
+ * workspace subpackages) are cloned into $DSH_HOME/plugin-manager-src and
+ * installed from there — the local-directory path the official CLI also
+ * supports. Custom subdir syntax: `repo#路径:packages/x` (the # in normal
+ * git specs is a ref/branch). The cache is kept: local-directory installs
+ * are pnpm links that need their source to stay in place.
+ */
+function prepareInstallSource(spec) {
+    const trimmed = spec.trim();
+    const gitUrl = /^(?:git\+)?(https?:\/\/[^\s#]+?)(?:#([^\s]*))?$/.exec(trimmed);
+    const gitFile = /^file:(\/\/[^\s#]+?)(?:#([^\s]*))?$/.exec(trimmed);
+    const gitSsh = /^([^\s@]+@[^\s:]+:[^\s#]+?)(?:#([^\s]*))?$/.exec(trimmed);
+    const githubShort = /^github:([^\s#]+?)(?:#([^\s]*))?$/.exec(trimmed);
+    const m = gitUrl ?? gitFile ?? gitSsh ?? githubShort;
+    if (m === null)
+        return { spec: trimmed };
+    let repo = m[1];
+    if (githubShort !== null && githubShort[1] !== undefined)
+        repo = "https://github.com/" + githubShort[1].replace(/^\.git/, '');
+    const frag = m[2] ?? '';
+    // Our subdir convention: `#路径:<relative-dir>` (a plain #ref stays a git ref).
+    let ref;
+    let subdir;
+    if (frag.startsWith('路径:'))
+        subdir = frag.slice(3);
+    else if (frag.length > 0)
+        ref = frag;
+    // pnpm git-protocol spec for the cloned source (installed INTO the profile
+    // tree so the plugin's dependencies resolve). A link install puts the code
+    // in the clone cache outside the profile, where bare imports cannot reach
+    // the profile/fallback node_modules — the crash reported for git-source
+    // plugins with regular dependencies (ERR_MODULE_NOT_FOUND). Subdir and
+    // workspace-subpackage clones have no reliable git-protocol form yet and
+    // keep the link install. file: git sources are local-only and also link.
+    let gitSpec;
+    if (subdir === undefined && gitFile === null) {
+        gitSpec = toGitSpec(repo, ref);
+    }
+    try {
+        const cacheRoot = join(dshHome(), 'plugin-manager-src');
+        mkdirSync(cacheRoot, { recursive: true });
+        // Drop a trailing .git so the clone dir name matches gitCacheIdentity
+        // (audit: git+https://…repo.git used to cache as …-repo-git).
+        const base = repo.replace(/^https?:\/\//, '').replace(/^git@/, '').replace(/^\/+/, '')
+            .replace(/\.git$/, '').replace(/[^A-Za-z0-9._-]/g, '-');
+        const dirName = base + (ref !== undefined ? '-' + ref.replace(/[^A-Za-z0-9._-]/g, '-') : '');
+        const dest = join(cacheRoot, dirName);
+        const created = !existsSync(dest);
+        if (created) {
+            const args = ['clone'];
+            if (ref !== undefined)
+                args.push('-b', ref);
+            args.push('--depth', '1', repo, dest);
+            const tool = resolveCommand('git');
+            const exec = resolveExec(tool, args);
+            execFileSync(exec.command, exec.args, { stdio: 'pipe', timeout: 3 * 60 * 1000, env: commandEnv(tool.dir), ...(exec.verbatim ? { windowsVerbatimArguments: true } : {}) });
+        }
+        const pkgDir = subdir !== undefined ? join(dest, subdir) : dest;
+        // The #路径: subdirectory must stay inside the clone cache — `../../`
+        // would turn the whole local filesystem into an install source (audit M20).
+        if (subdir !== undefined && !resolve(pkgDir).startsWith(resolve(dest) + sep)) {
+            return { error: 'subdirectory escapes the clone cache: ' + JSON.stringify(subdir) };
+        }
+        if (existsSync(join(pkgDir, 'package.json'))) {
+            try {
+                const manifest = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8'));
+                if (typeof manifest.name === 'string' && manifest.name.length > 0) {
+                    return {
+                        spec: pkgDir,
+                        packageName: manifest.name,
+                        created,
+                        gitSpec,
+                        note: 'cloned ' + repo + (subdir !== undefined ? ' (' + subdir + ')' : '') + ' into ' + dest,
+                    };
+                }
+            }
+            catch { /* unreadable manifest: continue below */ }
+        }
+        if (!existsSync(join(pkgDir, 'package.json'))) {
+            // Auto-detect workspace packages when the root is not a package.
+            const candidates = discoverWorkspacePackages(dest);
+            if (candidates.length === 1) {
+                return { spec: candidates[0], note: 'cloned ' + repo + ' into ' + dest + ' (package: ' + candidates[0] + ')' };
+            }
+            if (candidates.length > 1) {
+                return {
+                    error: 'the repository contains multiple packages (' + candidates.map(c => c.split('/').pop()).join(', ') + '); install with #路径:<dir> to pick one',
+                };
+            }
+            // No package.json anywhere: not a cordis plugin — could be a skill or
+            // agent-preset repo (neither ships a manifest). Keep the clone and let
+            // installWithSource's type detection decide.
+            return {
+                spec: pkgDir,
+                created,
+                note: 'cloned ' + repo + ' into ' + dest + ' (no package.json — kind detection will decide)',
+            };
+        }
+        return {
+            spec: pkgDir,
+            created,
+            note: 'cloned ' + repo + (subdir !== undefined ? ' (' + subdir + ')' : '') + ' into ' + dest + ' — keep this cache directory: the installed package links to it',
+        };
+    }
+    catch (error) {
+        return { error: 'git clone failed: ' + (error instanceof Error ? error.message : String(error)) };
+    }
+}
+/**
+ * Latest dist-tag manifest of an npm package. Uses the registry's /latest
+ * endpoint (a tiny document) instead of `npm view` (which pulls the full
+ * packument and routinely exceeds short timeouts on slow networks), through
+ * the proxy-aware marketplaceFetch (15s cap) with one retry. Registry
+ * resolved from the npm config so mirrors and private registries work.
+ */
+async function npmRegistryManifest(packageName) {
+    let registry = 'https://registry.npmjs.org/';
+    try {
+        const tool = resolveCommand('npm');
+        const exec = resolveExec(tool, ['config', 'get', 'registry']);
+        const config = execFileSync(exec.command, exec.args, {
+            encoding: 'utf8',
+            timeout: 5_000,
+            stdio: ['ignore', 'pipe', 'ignore'],
+            windowsHide: true,
+            env: commandEnv(tool.dir),
+            ...(exec.verbatim ? { windowsVerbatimArguments: true } : {}),
+        });
+        const trimmed = config.trim();
+        if (trimmed.length > 0)
+            registry = trimmed.endsWith('/') ? trimmed : trimmed + '/';
+    }
+    catch { /* registry defaults to npmjs.org */ }
+    // Scoped packages keep their slash: encodeURIComponent would turn the `/`
+    // into %2F, which some private registries/proxies 404 (audit M4) — encode
+    // each segment instead.
+    const encodedName = packageName.startsWith('@')
+        ? packageName.split('/').map(part => encodeURIComponent(part)).join('/')
+        : encodeURIComponent(packageName);
+    const url = registry + encodedName + '/latest';
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            const response = await marketplaceFetch(url, {
+                headers: { ...GITHUB_UA },
+                redirect: 'follow',
+            });
+            if (response.ok) {
+                const doc = await response.json();
+                return typeof doc.version === 'string' ? doc : undefined;
+            }
+            return undefined; // 404 / 4xx: not published (no retry for definitive answers)
+        }
+        catch {
+            // network / timeout: retry once, then report undetected
+        }
+    }
+    return undefined;
+}
+/** Latest dist-tag version of an npm package (version-only wrapper). */
+async function npmRegistryLatest(packageName) {
+    return (await npmRegistryManifest(packageName))?.version;
+}
+/**
+ * npm-first probe: returns the package name ONLY when the npm package is a
+ * real DSH plugin (declares the dsh field or depends on the DSH core).
+ * Skill / agent-preset / non-plugin repos that happen to publish npm packages
+ * (e.g. a skill repo whose name collides with an npm package) must fall
+ * through to the clone + type-detection path — installing them as cordis
+ * plugins would mount a useless dependency instead of the skill.
+ */
+async function probeNpmPublished(packageName) {
+    const manifest = await npmRegistryManifest(packageName);
+    if (manifest === undefined)
+        return undefined;
+    return looksLikeDshPlugin(manifest) === true ? packageName : undefined;
+}
+/** Bare-package root of a specifier (subpath imports resolve through it). */
+function declaredRoot(spec) {
+    if (spec.startsWith('@')) {
+        const parts = spec.split('/');
+        return parts.length >= 2 ? parts[0] + '/' + parts[1] : undefined;
+    }
+    const first = spec.split('/')[0];
+    return first !== undefined && first.length > 0 ? first : undefined;
+}
+/** Find cordis-style packages inside a cloned repository (depth 3). */
+function discoverWorkspacePackages(root) {
+    const found = [];
+    const walk = (dir, depth) => {
+        if (depth > 3)
+            return;
+        let entries = [];
+        try {
+            entries = readdirSync(dir, { withFileTypes: true });
+        }
+        catch {
+            return;
+        }
+        for (const entry of entries) {
+            if (entry.name === 'node_modules' || entry.name === '.git')
+                continue;
+            const full = join(dir, entry.name);
+            if (entry.isDirectory()) {
+                if (existsSync(join(full, 'package.json'))) {
+                    try {
+                        const manifest = JSON.parse(readFileSync(join(full, 'package.json'), 'utf8'));
+                        const dsh = manifest['dsh'];
+                        const isPlugin = dsh?.bundle !== undefined;
+                        if (isPlugin)
+                            found.push(full);
+                    }
+                    catch { /* unreadable manifest: skip */ }
+                }
+                else {
+                    walk(full, depth + 1);
+                }
+            }
+        }
+    };
+    walk(root, 0);
+    return found;
+}
+/**
+ * Global mutation mutex (process-local): profile-changing operations
+ * (install / remove / update / toggle / mount / insert-row edits) run
+ * strictly serially. Without it, concurrent pnpm calls rewrite the profile
+ * manifest from their own snapshots (lost dependencies), concurrent patch
+ * edits lose rows, and the quality gate scans node_modules mid-change —
+ * all three collapse to no-ops under serialization. The kind-record and
+ * blocklist stores already serialize their own files.
+ *
+ * Process-local only: the dshpm CLI is a separate process (cross-process
+ * locking is out of scope — concurrent CLI mutations are rare).
+ */
+let mutationQueue = Promise.resolve();
+function enqueueMutation(task) {
+    const run = mutationQueue.then(task, task);
+    mutationQueue = run.catch(() => { });
+    return run;
+}
+/**
+ * Install with source preparation: git sources (not published on npm,
+ * workspace subpackages) are cloned into a cache directory and installed
+ * from there — the "official path" for repositories that never reached the
+ * registry — with npm-first when the cloned package is published. ctx null
+ * = out-of-process caller (the dshpm CLI). Serialized by the mutation mutex.
+ */
+export function installWithSource(ctx, profile, spec, answers, locale) {
+    return enqueueMutation(() => installWithSourceInner(ctx, profile, spec, answers, locale));
+}
+async function installWithSourceInner(ctx, profile, spec, answers, locale) {
+    // npm-first BEFORE cloning for plain GitHub URLs (the marketplace shape:
+    // repo name == npm name). A pinned ref / subdir requests a specific git
+    // state, so those still clone. On slow networks the registry /latest
+    // probe is tiny and fast, so the npm path wins instead of a doomed clone.
+    const plainGit = /^(?:https?:\/\/)?(?:www\.)?github\.com\/([^\/#\s]+)\/([^\/#\s]+?)(?:\.git)?$/.exec(spec.trim());
+    if (plainGit !== null) {
+        const npmName = await probeNpmPublished(plainGit[2]);
+        if (npmName !== undefined) {
+            const result = await installProtected(ctx, profile, npmName);
+            return {
+                ...result,
+                output: result.output + '\n[plugin-manager] installed from npm (' + npmName + ' — the GitHub repository publishes it)',
+            };
+        }
+    }
+    const prepared = prepareInstallSource(spec);
+    if (prepared.error !== undefined || prepared.spec === undefined) {
+        return { ok: false, exitCode: 1, output: '[plugin-manager] ' + (prepared.error ?? 'no install source') };
+    }
+    // Kind detection for cloned/local sources: skill and agent-preset repos
+    // install directly (file copies into the official harness roots + an
+    // install record); instructions (not plugin/skill/preset) are refused with
+    // guidance and added to the marketplace blocklist; cordis plugins continue
+    // through the existing npm-first + quality-gate path below.
+    const repoKey = normalizeRepoRef(spec) ?? spec;
+    // C2: env injection for git-source installs — host credentials are NOT
+    // passed to third-party lifecycle scripts (prepare/build); the user's
+    // scanned answers (whitelist-validated below) are merged on top.
+    let envAnswers;
+    if (existsSync(prepared.spec)) {
+        const kind = detectRepoType(prepared.spec);
+        if (kind === 'skill' || kind === 'agent-preset') {
+            try {
+                // Names owned by OTHER live records must not be silently
+                // overwritten by this install (audit m1).
+                const records = await loadKindRecords();
+                const occupied = new Set();
+                for (const [otherKey, record] of records) {
+                    if (otherKey === repoKey)
+                        continue;
+                    for (const name of record.names ?? [])
+                        occupied.add(name);
+                }
+                const installed = kind === 'skill'
+                    ? installSkill(prepared.spec, repoKey, occupied)
+                    : installPreset(prepared.spec, repoKey, occupied);
+                await saveKindRecord(repoKey, {
+                    type: kind,
+                    name: installed.name,
+                    names: installed.names,
+                    location: installed.location,
+                    version: null,
+                    installedAt: new Date().toISOString(),
+                });
+                return {
+                    ok: true,
+                    exitCode: 0,
+                    output: '[plugin-manager] installed ' + (kind === 'skill' ? 'skill' : 'agent preset')
+                        + ' "' + installed.name + '" to ' + installed.location
+                        + (prepared.note !== undefined ? '\n' + prepared.note : '')
+                        + '\n' + (kind === 'skill'
+                        ? 'Skills hot-reload (chokidar watch on <dshHome>/skills) — no restart needed.'
+                        : 'Presets are discovered per session — pick it in the agent-preset picker.'),
+                };
+            }
+            catch (error) {
+                return {
+                    ok: false,
+                    exitCode: 1,
+                    output: '[plugin-manager] ' + (kind === 'skill' ? 'skill' : 'agent preset') + ' install failed: '
+                        + (error instanceof Error ? error.message : String(error)),
+                };
+            }
+        }
+        if (kind === 'instructions') {
+            // Not a plugin, skill, or preset: refuse, block from the marketplace,
+            // and point the user at what the repository actually is.
+            await addBlockedRepo(repoKey).catch(() => { });
+            const readmeHint = readmeFirstLines(prepared.spec);
+            return {
+                ok: false,
+                exitCode: 1,
+                output: '[plugin-manager] ' + repoKey
+                    + ' is not a DSH plugin, skill, or agent preset (no dsh-capable package.json, SKILL.md, or agent.cordis.yml).'
+                    + ' It has been added to the marketplace blocklist.'
+                    + (readmeHint.length > 0 ? '\n\nRepository README (first lines):\n' + readmeHint : '')
+                    + '\n\nIf the repository ships install.sh/install.ps1, we never auto-execute third-party scripts — run it manually if you trust the repo:'
+                    + '\n  cd ' + prepared.spec + ' && bash install.sh',
+            };
+        }
+        // cordis-plugin: continue to the npm-first + quality-gate path below,
+        // after the C2 env-requirement scan (git-source installs only).
+        const scanned = await scanRequirements(prepared.spec);
+        if (scanned.length > 0) {
+            const session = getInstallSession(spec);
+            const supplied = answers !== undefined && Object.keys(answers).length > 0;
+            if (supplied) {
+                // Materials provided: whitelist-validate against the scan, then
+                // continue with them injected into the pnpm subprocess env. The
+                // whitelist comes from the session when present (Web flow), else
+                // from this scan (out-of-process dshpm CLI: sessions are in-process
+                // memory, and an explicit --env is the user's own consent).
+                envAnswers = filterAnswers(session !== undefined ? session.scanned : scanned, answers);
+                if (session !== undefined)
+                    dropInstallSession(spec);
+            }
+            else {
+                // No session or no materials yet: (re)create the session, keep the
+                // clone, and pause the install asking for the missing variables.
+                createInstallSession(spec, prepared.spec, scanned);
+                return {
+                    ok: false,
+                    exitCode: null,
+                    output: '[plugin-manager] install paused: this repository requests the following environment variable(s) at install time: '
+                        + scanned.join(', ')
+                        + '. Re-submit the install with answers (an empty value skips the variable).',
+                    awaiting: {
+                        spec,
+                        questions: scanned.map(v => ({
+                            id: v,
+                            header: 'Environment variable: ' + v,
+                            question: 'The repository requests ' + v + ' during install/build. Leave empty to skip.',
+                        })),
+                    },
+                };
+            }
+        }
+    }
+    // npm-first: when the cloned package is published on the registry, prefer
+    // the npm install (faster, no local link); fall back to the git clone.
+    // The git fallback runs with a filtered env (see gitSourceEnv); the npm
+    // path keeps the host env so private-registry tokens (.npmrc auth) work.
+    const npmName = prepared.packageName !== undefined ? await probeNpmPublished(prepared.packageName) : undefined;
+    // Git-protocol install when the source has an equivalent (root package of
+    // a git URL): the code lands inside the profile tree and pnpm installs the
+    // plugin's dependencies, so its imports resolve. Subdir/workspace/file:
+    // sources have no git-protocol form and keep the link install (their bare
+    // imports may fail to resolve — see prepareInstallSource).
+    const gitSpec = prepared.gitSpec;
+    const result = npmName !== undefined
+        ? await installProtected(ctx, profile, npmName)
+        : await installProtected(ctx, profile, gitSpec ?? prepared.spec, gitSourceEnv(envAnswers));
+    const note = npmName !== undefined
+        ? 'installed from npm (' + npmName + '; the repository also publishes it)'
+        : gitSpec !== undefined
+            ? prepared.note + ' (installed via git protocol; the clone cache is kept for updates and quality checks)'
+            : prepared.note;
+    const output = note !== undefined
+        ? result.output + '\n[plugin-manager] ' + note
+        : result.output;
+    if (!result.ok) {
+        // Append a readable failure classification when the raw output matches a
+        // known npm/pnpm failure signature (browser language on the Web UI,
+        // process locale on the CLI).
+        const hintOutput = withFailureHint(output, locale);
+        // A failed install leaves a clone behind only if it is unreferenced:
+        // git sources often lack committed build artifacts (dist/lib), which
+        // the quality gate catches as an unresolvable entry file — clean the
+        // freshly created cache dir and say so.
+        if (prepared.created && !cacheDirReferencedByProfile(dshHome(), prepared.spec)) {
+            try {
+                rmSync(prepared.spec, { recursive: true, force: true });
+                return {
+                    ...result,
+                    output: hintOutput + '\n[plugin-manager] the repository may not commit build artifacts (dist/lib), or the package is not published to npm — check that the main/exports entry file exists in the repo, or install the npm package by name. Removed the unused clone cache.',
+                };
+            }
+            catch { /* cleanup is best-effort */ }
+        }
+        return {
+            ...result,
+            output: hintOutput + '\n[plugin-manager] the repository may not commit build artifacts (dist/lib), or the package is not published to npm — check that the main/exports entry file exists in the repo, or install the npm package by name.',
+        };
+    }
+    if (result.ok) {
+        // cordis-plugin install succeeded: keep a kind record so the
+        // marketplace uninstall / listKinds surfaces it (audit m3 — previously
+        // cordis installs never recorded anything and uninstall-kind was dead
+        // for them). The record also carries the target profile.
+        const installedNames = result.installed ?? [];
+        if (installedNames.length > 0) {
+            try {
+                await saveKindRecord(repoKey, {
+                    type: 'cordis-plugin',
+                    name: installedNames[0] ?? null,
+                    names: installedNames.length > 0 ? [...installedNames] : null,
+                    location: join(profileDir(profile), 'node_modules'),
+                    version: null,
+                    installedAt: new Date().toISOString(),
+                    profile: profile,
+                });
+            }
+            catch { /* the install record is advisory */ }
+        }
+    }
+    return { ...result, output };
+}
+/**
+ * C2: env for a git-source install — the host's full environment is NOT
+ * passed to the third-party package's lifecycle scripts (prepare/postinstall
+ * inherit the pnpm subprocess env, so a full pass-through would hand every
+ * host token/key to unaudited code). Sensitive keys are stripped; the user's
+ * scanned answers (already whitelist-validated against the repo scan) are
+ * merged on top.
+ */
+function gitSourceEnv(answers) {
+    const env = buildFilteredEnv();
+    if (answers !== undefined) {
+        for (const [key, value] of Object.entries(answers))
+            env[key] = value;
+    }
+    return env;
+}
+/** First lines of a repository README (install-guidance for refused repos). */
+function readmeFirstLines(dir) {
+    for (const file of ['README.md', 'readme.md', 'README.zh.md', 'README.en.md']) {
+        try {
+            const text = readFileSync(join(dir, file), 'utf8');
+            const trimmed = text.trim();
+            if (trimmed.length === 0)
+                continue;
+            return trimmed.split(/\r?\n/).slice(0, 12).join('\n').slice(0, 600);
+        }
+        catch { /* try the next README variant */ }
+    }
+    return '';
+}
+/**
+ * Post-install entry verification: warn when the installed package's load
+ * entries (main / exports "." and "./client", conditional exports recursed)
+ * are missing from the installed directory — the package is present but will
+ * not load. Source-only repos that never committed build artifacts land here.
+ */
+/**
+ * Install-time peer warning note: pnpm warns about "missing peer" for the
+ * official @deepseek-ai/* packages because the profile does not declare them
+ * — the host provides them one level up (profiles/node_modules) and every
+ * plugin shares that single instance. The warning is harmless noise; the
+ * note explains it at the exact moment the user sees it.
+ */
+const PEER_WARNING_NOTE = '\n[plugin-manager] note: pnpm "missing peer @deepseek-ai/*" warnings are harmless — '
+    + 'the DSH host provides these packages in the shared profiles/node_modules; do NOT install them into the profile '
+    + '(a second copy would split module identity and break the plugin).';
+function entryWarning(profile, packageName) {
+    const pkgDir = join(profileDir(profile), 'node_modules', packageName);
+    try {
+        const manifest = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8'));
+        const targets = [];
+        if (typeof manifest.main === 'string' && manifest.main.length > 0)
+            targets.push(manifest.main);
+        const collect = (node) => {
+            if (typeof node === 'string') {
+                if (node.length > 0)
+                    targets.push(node);
+                return;
+            }
+            if (node === null || typeof node !== 'object')
+                return;
+            for (const value of Object.values(node))
+                collect(value);
+        };
+        if (manifest.exports !== null && typeof manifest.exports === 'object') {
+            const exportsObj = manifest.exports;
+            for (const sub of ['.', './client']) {
+                if (Object.prototype.hasOwnProperty.call(exportsObj, sub))
+                    collect(exportsObj[sub]);
+            }
+        }
+        // A pure client-manifest plugin needs no host entry (browser-only).
+        if (targets.length === 0 && manifest.dsh?.client !== undefined)
+            return '';
+        const missing = targets.filter(target => !existsSync(join(pkgDir, target)));
+        return missing.length > 0
+            ? '\n[plugin-manager] ⚠ ' + packageName + ' installed but its load entries are missing: ' + missing.join(', ')
+                + ' — the plugin may not take effect; check the repository build instructions (source-only repos need a build step).'
+            : '';
+    }
+    catch {
+        return '';
+    }
+}
+/** Locale of the host process (CLI and terminal output); default English. */
+function hostLocale() {
+    const lang = (process.env.LANG ?? process.env.LC_ALL ?? process.env.LC_MESSAGES ?? '').trim();
+    return /^zh/i.test(lang) ? 'zh' : 'en';
+}
+/**
+ * Locale from an Accept-Language request header (browser sends it on
+ * same-origin fetch): zh* wins, anything else falls back to the host locale.
+ */
+function acceptLanguageLocale(header) {
+    if (header === undefined || header.length === 0)
+        return hostLocale();
+    for (const part of header.split(',')) {
+        const lang = part.trim().split(';')[0]?.toLowerCase() ?? '';
+        if (lang === 'zh' || lang.startsWith('zh-'))
+            return 'zh';
+    }
+    return 'en';
+}
+/**
+ * Classify common npm/pnpm failure signatures into a readable
+ * troubleshooting hint (bilingual — the Web UI picks the browser language,
+ * the CLI picks the process locale).
+ */
+function classifyInstallFailure(text) {
+    const rules = [
+        [/ENOTFOUND|ETIMEDOUT|ECONNRESET|ECONNREFUSED|socket hang up|premature close|network request failed/i,
+            '网络错误：无法连接 npm registry / GitHub，请检查网络或代理后重试。',
+            'Network error: cannot reach the npm registry / GitHub — check your network or proxy and retry.'],
+        [/EINTEGRITY|integrity checksum failed/i,
+            '依赖完整性校验失败（常见于网络缓存损坏）：删除依赖目录后重试，或清 npm 缓存（npm cache clean --force）。',
+            'Dependency integrity check failed (often a corrupted network cache): delete the dependency directory and retry, or clear the npm cache (npm cache clean --force).'],
+        [/ETARGET|No matching version|404 Not Found|E404|ENOVERSIONS/i,
+            '依赖版本不存在：某个依赖或其版本在 registry 找不到（私有包、版本号错误或未发布）。',
+            'Dependency version not found: a dependency or its version is missing from the registry (private package, wrong version, or not published).'],
+        [/gyp ERR|node-gyp|python(3)?(\s|\.exe)? not found|not found: python/i,
+            '原生模块编译失败：node-gyp 需要 Python 与 C++ 构建工具链，请先安装（Windows: Visual Studio Build Tools）。',
+            'Native module build failed: node-gyp needs Python and a C++ toolchain (Windows: Visual Studio Build Tools).'],
+        [/MODULE_NOT_FOUND|Cannot find module/i,
+            '缺少模块：包或依赖不完整——可能是源码型仓库未构建，或本地链接依赖被剥离后仍被引用。',
+            'Missing module: the package or its dependencies are incomplete — the repo may be source-only without a build step, or a local link dependency was pruned while still referenced.'],
+        [/ERR_PNPM|Command failed/i,
+            '构建/包管理命令失败：请查看上方日志输出定位具体步骤。',
+            'Build/package-manager command failed: check the log output above to locate the failing step.'],
+        [/EACCES|EPERM|EBUSY/i,
+            '权限/占用错误：目标目录被占用或没有写入权限（Windows 常见：杀毒软件锁文件）。',
+            'Permission/lock error: the target directory is in use or not writable (on Windows antivirus software often locks files).'],
+    ];
+    for (const [re, zh, en] of rules) {
+        if (re.test(text))
+            return { zh, en };
+    }
+    return null;
+}
+/** Append the failure classification (if any) to a command output. */
+function withFailureHint(output, locale = hostLocale()) {
+    const hint = classifyInstallFailure(output);
+    return hint !== null ? output + '\n[plugin-manager] ' + hint[locale] : output;
+}
+/** Whether any profile manifest references the given install path (link:). */
+function cacheDirReferencedByProfile(home, pkgDir) {
+    const profilesRoot = join(home, 'profiles');
+    let entries = [];
+    try {
+        entries = readdirSync(profilesRoot, { withFileTypes: true })
+            .filter(e => e.isDirectory())
+            .map(e => e.name);
+    }
+    catch {
+        return false;
+    }
+    for (const name of entries) {
+        try {
+            const manifest = JSON.parse(readFileSync(join(profilesRoot, name, 'package.json'), 'utf8'));
+            for (const value of Object.values(manifest.dependencies ?? {})) {
+                if (value.includes(pkgDir))
+                    return true;
+            }
+        }
+        catch { /* unreadable profile: skip */ }
+    }
+    return false;
+}
+/**
+ * Shared install path: pnpm add through the official CLI, resolve the real
+ * package name, mount non-bundle plugins as managed insert rows, restore
+ * in-box bundles, and run a quality check (undeclared runtime imports and
+ * official packages declared as regular dependencies are the main reasons
+ * third-party plugins break a profile — auto-rollback on failure).
+ *
+ * ctx is the live host context when a profile instance is running (live
+ * apply of insert rows) and null for out-of-process callers (the dshpm
+ * CLI): the file-level install, quality gate, and rollback are identical,
+ * only the live-mount step is skipped.
+ */
+export async function installProtected(ctx, profile, spec, env) {
+    const before = readBundles(profile);
+    const result = await runDshPlugin(profile, 'add', [spec], process.cwd(), env);
+    if (!result.ok)
+        return result;
+    restoreInBoxBundles(profile, before);
+    const installed = resolveInstalledName(profile, spec);
+    if (installed === null)
+        return { ...result, installed: [] };
+    // Quality gate: scan the installed package entry for imports its manifest
+    // does not declare and the loader does not provide. Undeclared deps fail
+    // at boot (ERR_MODULE_NOT_FOUND) and take the whole profile down.
+    const issues = qualityIssues(profile, installed);
+    if (issues.length > 0) {
+        // Roll back: remove the dependency and any insert row written below.
+        await runDshPlugin(profile, 'remove', [installed], process.cwd());
+        restoreInBoxBundles(profile, before);
+        cleanupInsertRows(ctx, profile, installed);
+        return {
+            ok: false,
+            exitCode: 1,
+            output: result.output
+                + "\n[plugin-manager] QUALITY CHECK FAILED for " + installed + ":"
+                + issues.map(issue => "\n  - " + issue).join("")
+                + "\n[plugin-manager] rolled back the install to keep the profile bootable.",
+            installed: [],
+        };
+    }
+    const isBundle = exportsBundlePatch(profile, installed);
+    // Post-install entry verification: warn when the load entries are missing
+    // (source-only repos), so "installed but not working" is caught up front.
+    const entryNote = entryWarning(profile, installed);
+    // Post-install analysis summary: dependency/conflict/compatibility issues
+    // between the new package and the profile (warnings — the install itself
+    // already passed the quality gate).
+    let analysisNote = '';
+    try {
+        const dir = profileDir(profile);
+        const bundles = readBundles(profile);
+        const analysis = analyzeProfile(dir, bundles, readPatch(dir), new Set(), []);
+        const related = analysis.issues.filter(issue => issue.from === installed || issue.to === installed || issue.cycle?.includes(installed));
+        if (related.length > 0) {
+            analysisNote = '\n[plugin-manager] analysis: ' + related.length + ' issue(s) for ' + installed + ':'
+                + related.map(issue => '\n  - ' + issue.message).join('');
+        }
+    }
+    catch { /* analysis is advisory */ }
+    if (isBundle) {
+        return {
+            ...result,
+            installed: [installed],
+            // Bundle layers load at the next start; the client must not claim a
+            // live mount for them.
+            live: false,
+            output: result.output + analysisNote + entryNote + PEER_WARNING_NOTE
+                + '\n[plugin-manager] bundle plugin added to the layer stack — restart the profile to load it (the catalog will show it then).',
+        };
+    }
+    // Non-bundle plugin: write the managed insert row (live mount).
+    const rowId = slugify(installed);
+    try {
+        const dir = profileDir(profile);
+        const current = readPatch(dir);
+        // A managed disable block we wrote earlier (a previous disable) is not a
+        // user row: drop it first, or readManagedIds misjudges it as user-owned
+        // and every re-install/mount of this package dies with id collision.
+        const cleaned = removeDisableBlock(current, rowId);
+        const base = cleaned !== current ? cleaned : current;
+        // An id collision with an existing row (user-written or another
+        // plugin's) would make the loader refuse the whole tree — fail this
+        // install instead of corrupting the patch.
+        const idOwner = readInsertRows(base).find(row => row.id === rowId && row.name !== installed);
+        const userOwnsId = readManagedIds(base).has(rowId);
+        if (idOwner !== undefined || userOwnsId) {
+            await runDshPlugin(profile, 'remove', [installed], process.cwd());
+            restoreInBoxBundles(profile, before);
+            return {
+                ok: false,
+                exitCode: 1,
+                output: result.output
+                    + "\n[plugin-manager] row id " + rowId + " is already used"
+                    + (idOwner !== undefined ? " by " + idOwner.name : " by a user row")
+                    + " (id collision) — rolled back the install. Rename the conflicting package or remove the other row first.",
+                installed: [],
+            };
+        }
+        const next = addInsertRow(base, rowId, installed);
+        const live = next !== base && ctx !== null && profile === hostProfileName()
+            ? await applyLiveOps(ctx, [{ kind: 'append', value: { insert: [{ id: rowId, name: installed }] } }])
+            : { ok: false, message: 'profile not running' };
+        if (next !== base)
+            writePatch(patchPath(dir), next);
+        if (!live.ok && /ERR_MODULE_NOT_FOUND|Cannot find package|failed to import/i.test(live.message ?? '')) {
+            // The mount failed because the module cannot be imported. Leaving the
+            // insert row in the patch would fail the WHOLE profile at the next
+            // boot — roll the row back instead (the dependency stays installed).
+            const rolledBack = removeInsertRow(next, rowId);
+            if (rolledBack.removed)
+                writePatch(patchPath(dir), rolledBack.content);
+            return {
+                ...result,
+                installed: [installed],
+                live: false,
+                output: result.output
+                    + "\n[plugin-manager] mount failed (" + (live.message ?? 'import error') + ")"
+                    + "\n[plugin-manager] insert row " + rowId + " rolled back — the profile stays bootable. Check the plugin's dependencies.",
+            };
+        }
+        return {
+            ...result,
+            installed: [installed],
+            live: live.ok,
+            output: result.output
+                + "\n[plugin-manager] quality check passed; mounted " + installed + " as insert row " + rowId + (live.ok ? " (applied live)" : " (file updated; " + (live.message ?? 'mounts on next restart') + ")")
+                + entryNote + PEER_WARNING_NOTE,
+        };
+    }
+    catch (error) {
+        return {
+            ...result,
+            installed: [installed],
+            live: false,
+            output: result.output + "\n[plugin-manager] install ok but insert row failed: " + (error instanceof Error ? error.message : String(error)),
+        };
+    }
+}
+/**
+ * Shared remove path: pnpm remove through the official CLI, preserving
+ * in-box bundles and cleaning up the managed insert rows of the removed
+ * package. ctx null = out-of-process caller (the dshpm CLI); the file
+ * removal is identical, only the live unmount is skipped. Serialized by the
+ * mutation mutex.
+ */
+export function removeProtected(ctx, profile, name) {
+    return enqueueMutation(() => removeProtectedInner(ctx, profile, name));
+}
+async function removeProtectedInner(ctx, profile, name) {
+    const before = readBundles(profile);
+    // Row ids the removal orphans (managed disable blocks must not survive
+    // the package): the mount id, the patch's insert-row ids, and the ids the
+    // package's own bundle patch declares. Collected BEFORE pnpm deletes the
+    // package files.
+    const orphanedIds = managedRowIdsOf(profile, name);
+    let result = await runDshPlugin(profile, 'remove', [name], process.cwd());
+    if (result.ok) {
+        restoreInBoxBundles(profile, before);
+        cleanupInsertRows(ctx, profile, name);
+        removeDisableBlocks(profile, orphanedIds);
+        // Live-unmount every loader row mounting the removed package in the
+        // running profile. pnpm remove only rewrites the manifest and deletes
+        // the package files; without an unmount the fiber stays mounted and the
+        // client boot table keeps serving its client entry — the browser then
+        // fails to load the deleted client.js on the next refresh and the whole
+        // UI dies until a restart (client-modules: bundle script ... failed to
+        // load). Disposing the fiber now lets the platform drop the entry.
+        if (ctx !== null && profile === hostProfileName()) {
+            await liveUnmountPackage(ctx, name);
+        }
+        // Plugin-owned agent presets: after the package is gone, delete its
+        // unmodified owned presets (see src/presets.ts). Presets are global, so
+        // skip when another profile still installs the plugin.
+        result = { ...result, output: result.output + '\n' + await presetCleanupNote(ctx, profile, name) };
+    }
+    return result;
+}
+/**
+ * Cleanup note appended to a removal result: deletes the removed plugin's
+ * unmodified owned agent presets through the host service when available
+ * (direct removal otherwise), reporting what was removed and what was kept
+ * and why. Never throws.
+ */
+async function presetCleanupNote(ctx, profile, name) {
+    try {
+        if (pluginInstalledInOtherProfiles(profile, name)) {
+            return '[plugin-manager] preset cleanup skipped for ' + name + ': still installed in another profile';
+        }
+        const result = await cleanupOwnedPresets(ctx, presetsDirPath(), name);
+        return formatCleanupResult(name, result);
+    }
+    catch (error) {
+        return '[plugin-manager] preset cleanup failed for ' + name + ': ' + (error instanceof Error ? error.message : String(error));
+    }
+}
+/**
+ * Collect the loader row ids a package owns in a profile: the managed mount
+ * id (slugify), every managed insert row id mounting it, and the row ids its
+ * own bundle patch inserts. Used to drop managed disable blocks whose row
+ * disappears with the package — a stale block would warn on every boot and
+ * silently disable a future plugin that reuses the same row id.
+ */
+function managedRowIdsOf(profile, packageName) {
+    const ids = new Set([slugify(packageName)]);
+    try {
+        const dir = profileDir(profile);
+        for (const row of readInsertRows(readPatch(dir))) {
+            if (row.name === packageName)
+                ids.add(row.id);
+        }
+    }
+    catch { /* patch rows are optional */ }
+    try {
+        const dir = profileDir(profile);
+        const manifest = JSON.parse(readFileSync(join(dir, 'node_modules', packageName, 'package.json'), 'utf8'));
+        const rel = manifest.dsh?.bundle?.patch;
+        if (typeof rel === 'string' && rel.length > 0) {
+            const patch = readFileSync(join(dir, 'node_modules', packageName, rel), 'utf8');
+            // Insert children and patched rows both declare their id the same way.
+            for (const match of patch.matchAll(/^\s*-\s+id:\s*['"]?([A-Za-z0-9._-]+)['"]?\s*$/gm)) {
+                if (match[1] !== undefined)
+                    ids.add(match[1]);
+            }
+        }
+    }
+    catch { /* a bundle patch is optional; the mount id already covers non-bundle rows */ }
+    return [...ids];
+}
+/**
+ * Drop managed disable blocks for the given row ids from a profile's patch
+ * file (best-effort; rows that never had a block are untouched).
+ */
+function removeDisableBlocks(profile, rowIds) {
+    try {
+        const dir = profileDir(profile);
+        const path = patchPath(dir);
+        let next = readPatch(dir);
+        for (const id of rowIds) {
+            const cleaned = removeDisableBlock(next, id);
+            if (cleaned !== next)
+                next = cleaned;
+        }
+        if (next !== readPatch(dir))
+            writePatch(path, next);
+    }
+    catch { /* block cleanup is best-effort */ }
+}
+/**
+ * Unmount every loader row mounting a package from the running profile's
+ * live include stack (best-effort). Used after a package removal so its
+ * fiber disposes immediately instead of lingering until the next restart.
+ */
+async function liveUnmountPackage(ctx, packageName) {
+    try {
+        await applyLiveOps(ctx, [{ kind: 'remove-by-name', name: packageName }]);
+    }
+    catch (error) {
+        console.error('[plugin-manager] live unmount failed:', error instanceof Error ? error.message : String(error));
+    }
+}
+/**
+ * Shared update path for one installed package (source-kind contract as on
+ * the service method): npm @latest reinstall / git-cache fetch+reset /
+ * git-URL re-resolve, each with the quality gate and rollback. ctx-free —
+ * usable from the dshpm CLI without a live host. Serialized by the
+ * mutation mutex.
+ */
+export function updateProtected(profile, name, locale) {
+    return enqueueMutation(() => updateProtectedInner(profile, name, locale));
+}
+async function updateProtectedInner(profile, name, locale) {
+    const dir = profileDir(profile);
+    if (!existsSync(dir))
+        return { ok: false, exitCode: 1, output: 'profile not found: ' + profile };
+    const manifest = readManifest(dir);
+    const source = manifest.dependencies?.[name];
+    if (source === undefined) {
+        return { ok: false, exitCode: 1, output: name + ' is not a dependency of ' + profile };
+    }
+    const before = readBundles(profile);
+    const local = parseLocalSource(source);
+    if (local !== null && isGitRepo(local)) {
+        // Git-cache update: fetch + hard reset the cache to its remote ref.
+        // The previous HEAD is remembered so a failed quality gate can restore
+        // the cache (gitPullToRemote already discarded the old worktree — the
+        // audit found the old rollback merely removed the package while the
+        // cache stayed on the broken new code and the message claimed a
+        // rollback that never happened).
+        const oldHead = await execFileTimeout('git', ['-C', local, 'rev-parse', 'HEAD'], 10_000);
+        const updated = await gitPullToRemote(local);
+        if (!updated.ok) {
+            return { ok: false, exitCode: 1, output: '[plugin-manager] git update failed: ' + updated.message };
+        }
+        // Reinstall through the git protocol (github:owner/repo) instead of
+        // re-linking the cache: the plugin's code then lives inside the profile
+        // tree and its dependencies resolve (a link install cannot reach the
+        // profile/fallback node_modules). This also migrates legacy link
+        // installs to the protocol form.
+        const gitSpec = await gitSpecFromCache(local);
+        const result = await runDshPlugin(profile, 'add', [gitSpec ?? local], process.cwd());
+        if (!result.ok)
+            return result;
+        restoreInBoxBundles(profile, before);
+        const issues = qualityIssues(profile, name);
+        if (issues.length > 0) {
+            // Restore the cache to the previous commit, then re-install the old
+            // code so the plugin stays usable (the old version passed the gate
+            // when it was installed).
+            let restoreNote = '';
+            if (oldHead.ok && oldHead.output.trim().length > 0) {
+                const restored = await execFileTimeout('git', ['-C', local, 'reset', '--hard', oldHead.output.trim()], 20_000);
+                if (restored.ok)
+                    restoreNote = '\n[plugin-manager] cache restored to the previous commit '
+                        + oldHead.output.trim().slice(0, 12);
+                else
+                    restoreNote = '\n[plugin-manager] WARNING: could not restore the cache (' + restored.output.trim().slice(0, 120) + ')';
+            }
+            await runDshPlugin(profile, 'remove', [name], process.cwd());
+            // Reinstall the previous commit through the git protocol (the old
+            // code passed the gate when it was installed).
+            const oldCommit = gitSpec !== undefined && oldHead.ok && oldHead.output.trim().length > 0
+                ? oldHead.output.trim()
+                : undefined;
+            const reinstall = await runDshPlugin(profile, 'add', [oldCommit !== undefined ? gitSpec + '#' + oldCommit : (gitSpec ?? local)], process.cwd());
+            restoreInBoxBundles(profile, before);
+            return {
+                ok: false,
+                exitCode: 1,
+                output: result.output + '\n[plugin-manager] QUALITY CHECK FAILED after update:'
+                    + issues.map(issue => '\n  - ' + issue).join('')
+                    + restoreNote
+                    + (reinstall.ok
+                        ? '\n[plugin-manager] the previous version was re-installed from the restored cache.'
+                        : '\n[plugin-manager] WARNING: re-installing the previous version failed: ' + reinstall.output.trim().slice(0, 200)),
+            };
+        }
+        return {
+            ok: true,
+            exitCode: 0,
+            output: result.output + '\n[plugin-manager] ' + name + ' updated from the git cache ('
+                + updated.message + '); restart the profile to load the new code.',
+        };
+    }
+    if (local !== null) {
+        return {
+            ok: false,
+            exitCode: 1,
+            output: '[plugin-manager] ' + name + ' is installed from a local directory (' + local
+                + ') with no git upstream; update is not possible. Remove and reinstall it.',
+        };
+    }
+    // npm or git-URL source: re-add through the official CLI.
+    // 显式钉住最新版本号：@latest 依赖 pnpm 对 dist-tag 的解析，在 pnpm 11
+    // minimumReleaseAge 或镜像 dist-tag 滞后时会解析到旧版或停在现有范围；
+    // 显式 <name>@<version> 重写 specifier，不受这些因素影响（见 updateSpec）。
+    const spec = updateSpec(source, name, await npmLatestVersion(name));
+    // Previous version captured for the rollback: a failed self-update must
+    // restore the old code, never uninstall the package (the manager itself
+    // would otherwise disappear from the profile).
+    const previousVersion = readPackageInfo(dir, name).version;
+    const result = await runDshPlugin(profile, 'add', [spec], process.cwd());
+    if (!result.ok)
+        return { ...result, output: withFailureHint(result.output, locale) };
+    restoreInBoxBundles(profile, before);
+    const installed = resolveInstalledName(profile, name);
+    if (installed === null)
+        return { ...result, installed: [name] };
+    const issues = qualityIssues(profile, installed);
+    if (issues.length > 0) {
+        let restored = false;
+        let rollbackLabel = '';
+        if (isGitSourceSpec(source)) {
+            // Git-protocol dependency: roll back to the previous commit (a version
+            // tag re-add would resolve from the registry and may not exist).
+            const oldCommit = gitCommitFromLock(profile, installed);
+            if (oldCommit !== undefined) {
+                const base = source.split('#')[0];
+                const reAdd = await runDshPlugin(profile, 'add', [base + '#' + oldCommit], process.cwd());
+                restored = reAdd.ok;
+                if (restored)
+                    rollbackLabel = ' (' + oldCommit.slice(0, 12) + ')';
+            }
+        }
+        else if (previousVersion !== undefined) {
+            const reAdd = await runDshPlugin(profile, 'add', [name + '@' + previousVersion], process.cwd());
+            restored = reAdd.ok;
+            if (restored)
+                rollbackLabel = ' (' + previousVersion + ')';
+        }
+        if (!restored)
+            await runDshPlugin(profile, 'remove', [installed], process.cwd());
+        restoreInBoxBundles(profile, before);
+        return {
+            ok: false,
+            exitCode: 1,
+            output: result.output + '\n[plugin-manager] QUALITY CHECK FAILED after update:'
+                + issues.map(issue => '\n  - ' + issue).join('')
+                + '\n[plugin-manager] rolled back to the previous version'
+                + (restored ? rollbackLabel : ' — reinstall the package manually'),
+        };
+    }
+    return {
+        ok: true,
+        exitCode: 0,
+        output: result.output + '\n[plugin-manager] ' + name + ' updated'
+            + (isGitSourceSpec(source) ? ' from its git source' : ' to @latest')
+            + '; restart the profile to load the new code.',
+    };
+}
+/**
+ * Specifiers the loader provides without the plugin declaring them: the
+ * client platform table plus the host-side cordis basics the profile
+ * bundles mount. Anything else a plugin imports must be in its manifest.
+ * The @deepseek-ai/dsh-client-* and @deepseek-ai/cordis-plugin-* families
+ * are platform packages (matched by prefix so the whitelist cannot drift
+ * from the web-app client table).
+ */
+const LOADER_PROVIDED = new Set([
+    'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client',
+    '@deepseek-ai/cordis',
+    '@deepseek-ai/cordis-plugin-loader', '@deepseek-ai/cordis-plugin-include',
+    '@deepseek-ai/cordis-plugin-group', '@deepseek-ai/cordis-plugin-hmr',
+    '@deepseek-ai/cordis-plugin-timer',
+    '@deepseek-ai/dsh-client-web-react',
+]);
+/** Whether the loader/platform provides a specifier without declaration. */
+function isLoaderProvided(spec) {
+    return LOADER_PROVIDED.has(spec)
+        || spec.startsWith('@deepseek-ai/dsh-client-')
+        || spec.startsWith('@deepseek-ai/cordis-plugin-');
+}
+// scanImports / scanPackageImports live in src/analyze.ts (shared with the
+// health-check engine so the gate and the analysis never drift).
+/** Collect every string target of an exports node (recursed). */
+function collectExportTargets(node, targets) {
+    if (typeof node === 'string') {
+        if (node.length > 0)
+            targets.push(node);
+        return;
+    }
+    if (node === null || typeof node !== 'object')
+        return;
+    for (const value of Object.values(node))
+        collectExportTargets(value, targets);
+}
+/**
+ * Resolve a package's entry file. Handles every common exports shape:
+ * `"exports": "./dist/main.js"`, `"exports": {".": "./dist/main.js"}`,
+ * `{".": {"default": ...}}` and nested conditions — a line-only default
+ * lookup misjudged valid string-exports packages as "no entry" and rolled
+ * back legal installs (audit M3).
+ */
+function packageEntry(pkgDir, manifest) {
+    const candidates = [];
+    const exportsField = manifest['exports'];
+    if (typeof exportsField === 'string') {
+        candidates.push(exportsField);
+    }
+    else if (exportsField !== null && typeof exportsField === 'object') {
+        const dot = exportsField['.'];
+        if (dot !== undefined)
+            collectExportTargets(dot, candidates);
+    }
+    if (typeof manifest['main'] === 'string')
+        candidates.push(manifest['main']);
+    if (typeof manifest['module'] === 'string')
+        candidates.push(manifest['module']);
+    for (const candidate of candidates) {
+        const resolved = join(pkgDir, candidate);
+        if (existsSync(resolved))
+            return resolved;
+    }
+    const index = join(pkgDir, 'index.js');
+    return existsSync(index) ? index : null;
+}
+/**
+ * Quality check for one installed package: undeclared bare imports that the
+ * loader does not provide are boot failures waiting to happen. Returns a
+ * list of issues (empty = healthy).
+ */
+function qualityIssues(profile, packageName) {
+    const pkgDir = join(profileDir(profile), 'node_modules', packageName);
+    let manifest;
+    try {
+        manifest = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8'));
+    }
+    catch (error) {
+        return ["cannot read its package.json: " + (error instanceof Error ? error.message : String(error))];
+    }
+    const declared = new Set([
+        ...Object.keys((manifest['dependencies'] ?? {})),
+        ...Object.keys((manifest['peerDependencies'] ?? {})),
+    ]);
+    const entry = packageEntry(pkgDir, manifest);
+    if (entry === null)
+        return ["no resolvable entry file (exports/main/index.js)"];
+    const issues = [];
+    // Official packages as REGULAR dependencies are the one install pattern
+    // that passes every import check and still breaks the profile at runtime:
+    // pnpm installs a second copy into the profile's node_modules, the Loader
+    // resolves the official bundle row to that copy (nearest-wins from the
+    // profile directory), and module identity splits between the copies
+    // (unique symbols / classes) — tool calls then fail with errors like
+    // "Cannot read properties of undefined (reading 'prepare')". The correct
+    // contract is a peerDependency: autoInstallPeers:false leaves peers to the
+    // shared installation fallback, so every plugin shares one instance.
+    const officialClosure = officialFallbackNames(profile);
+    for (const dep of Object.keys((manifest['dependencies'] ?? {}))) {
+        if (dep.startsWith('@deepseek-ai/') && officialClosure.has(dep) && !OFFICIAL_DEP_ALLOWED.has(dep)) {
+            issues.push("declares official package " + dep + " as a REGULAR dependency: pnpm installs a second copy into "
+                + "the profile and the loader resolves the official row to it, splitting module identity (runtime failures "
+                + "like 'Cannot read properties of undefined (reading \'prepare\')'). Declare it as a peerDependency instead "
+                + "(the profile falls through to the installation's shared copy), or drop the declaration.");
+        }
+    }
+    // Scan the WHOLE load chain (entry + every file reachable through relative
+    // imports): an undeclared import one hop down fails at boot exactly like
+    // one in the entry.
+    const imports = scanPackageImports(pkgDir, entry);
+    for (const spec of imports) {
+        // A subpath import (unpdf/pdfjs) is covered by declaring its parent
+        // package (unpdf): Node resolves subpaths through the parent entry.
+        const parent = declaredRoot(spec);
+        if (declared.has(spec) || (parent !== undefined && declared.has(parent)) || isLoaderProvided(spec))
+            continue;
+        issues.push("imports " + spec + " but does not declare it (would fail at boot)");
+    }
+    // Declared is not installed: a dependency line that pnpm could not place
+    // (e.g. a link: source that is not present) fails exactly like an
+    // undeclared import at boot — and takes the whole profile down.
+    for (const spec of imports) {
+        if (!declared.has(spec) || isLoaderProvided(spec))
+            continue;
+        if (!bareSpecifierResolves(profileDir(profile), spec)) {
+            issues.push("declares " + spec + " but it is not installed in the profile (would fail at boot)");
+        }
+    }
+    // Bundle plugins also mount rows from their own cordis.patch.yml — every
+    // row name must resolve, or the whole profile fails at boot.
+    const dsh = manifest['dsh'];
+    const bundle = dsh?.bundle;
+    const patchFile = typeof bundle?.patch === 'string' ? bundle.patch : undefined;
+    if (patchFile !== undefined) {
+        const patchPath = join(pkgDir, patchFile);
+        const rows = readBundleRows(patchPath);
+        for (const rowName of rows) {
+            if (rowName.startsWith('cordis:') || rowName.startsWith('.'))
+                continue;
+            if (isLoaderProvided(rowName))
+                continue;
+            if (!bareSpecifierResolves(profileDir(profile), rowName) && rowName !== packageName) {
+                issues.push("bundle patch mounts " + rowName + " but it is not installed in the profile (would fail at boot)");
+            }
+        }
+    }
+    return issues;
+}
+/**
+ * Package names the dsh installation provides: the shared fallback
+ * profiles/node_modules closure (healProfilesModuleFallback's symlink
+ * farm). A profile-local copy of any of these — installed through a regular
+ * dependency — duplicates an installation-owned module; see the
+ * quality-gate check above.
+ */
+function officialFallbackNames(profile) {
+    return scanNodeModulesNames(join(dirname(profileDir(profile)), 'node_modules'));
+}
+/** Row module names in a bundle's own cordis.patch.yml (best-effort parse). */
+function readBundleRows(patchFile) {
+    try {
+        const content = readFileSync(patchFile, 'utf8');
+        const rows = [];
+        const pattern = /^\s*name:\s*(.+)$/gm;
+        for (const match of content.matchAll(pattern)) {
+            const name = match[1].trim().replace(/^['"]|['"]$/g, '');
+            if (name.length > 0)
+                rows.push(name);
+        }
+        return rows;
+    }
+    catch {
+        return [];
+    }
+}
+/** Whether a bare specifier resolves inside a profile's node_modules. */
+function bareSpecifierResolves(profileDirPath, spec) {
+    // Node builtins are unconditionally provided by the runtime — they resolve
+    // without any node_modules entry (defense in depth: imports are already
+    // filtered by scanImports, but bundle patch row names also flow through
+    // here).
+    if (isBuiltin(spec))
+        return true;
+    const roots = [join(profileDirPath, 'node_modules'), join(profileDirPath, '..', 'node_modules')];
+    for (const root of roots) {
+        try {
+            if (existsSync(join(root, spec)))
+                return true;
+            // Scoped subpath (pkg/sub) — the package itself is the provider.
+            if (spec.includes('/') && spec.startsWith('@')) {
+                const parts = spec.split('/');
+                if (existsSync(join(root, parts[0], parts[1])))
+                    return true;
+            }
+        }
+        catch { /* keep probing */ }
+    }
+    return false;
+}
+/**
+ * Windows process table as "pid<TAB>command line" lines (powershell +
+ * CIM). The command line contains the full node/dsh paths and the
+ * --profile/--port flags, so the shared parser below works unchanged.
+ */
+function windowsProcessLines() {
+    try {
+        const script = [
+            'Get-CimInstance Win32_Process',
+            "| Where-Object { $_.CommandLine -and $_.CommandLine -match 'dsh' }",
+            '| ForEach-Object { $_.ProcessId.ToString() + [char]9 + $_.CommandLine }',
+        ].join(' ');
+        const output = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], {
+            encoding: 'utf8',
+            timeout: 15_000,
+            maxBuffer: 16 * 1024 * 1024,
+            stdio: ['ignore', 'pipe', 'ignore'],
+            windowsHide: true,
+        });
+        return output.split(/\r?\n/);
+    }
+    catch {
+        return [];
+    }
+}
+function scanRuns() {
+    // Collect every match per profile, then resolve the primary process: the
+    // real node process when present (a .cmd/.bat shim or bash wrapper is only
+    // its launcher — killing the wrapper alone would orphan the instance),
+    // preferring the entry carrying a --port, as before.
+    const byProfile = new Map();
+    try {
+        const output = process.platform === 'win32'
+            ? windowsProcessLines()
+            : execFileSync('ps', ['-eo', 'pid=,args='], { encoding: 'utf8' }).split('\n');
+        for (const line of output) {
+            let match = /^\s*(\d+)\s+(.*\bdsh\b.*--profile\s+(\S+))/.exec(line);
+            let profile;
+            let pid;
+            if (match !== null) {
+                pid = Number(match[1]);
+                profile = match[3];
+            }
+            else {
+                // `dsh web`/`dsh headless` command mode (no --profile flag).
+                match = /^\s*(\d+)\s+.*\bbin\.js\s+(\S+)/.exec(line);
+                if (match !== null) {
+                    pid = Number(match[1]);
+                    profile = match[2];
+                }
+            }
+            if (profile === undefined || pid === undefined)
+                continue;
+            // Parse --port from the whole line (the --profile group ends at the name).
+            const portMatch = /--port\s+(\d+)/.exec(line);
+            const port = portMatch === null ? null : Number(portMatch[1]);
+            // A line naming node or a .js script is the real instance; a bare shim
+            // (dsh.cmd / bash wrapper) is only its launcher.
+            const node = /\bnode(?:\.exe)?\b|\b[\w-]+\.js\b/.test(line);
+            const list = byProfile.get(profile);
+            if (list === undefined)
+                byProfile.set(profile, [{ port, pid, node }]);
+            else
+                list.push({ port, pid, node });
+        }
+    }
+    catch {
+        /* ps/powershell unavailable: no runs reported */
+    }
+    const out = new Map();
+    for (const [name, matches] of byProfile) {
+        const withPort = matches.filter(match => match.port !== null);
+        // The primary is a real node process — prefer the one explicitly started
+        // with --port (the plugin's own spawns) over a port-less default instance
+        // (`dsh web`): stopping the wrong one would take down a profile the user
+        // may not have started from this page.
+        const node = matches.find(match => match.node && match.port !== null)
+            ?? matches.find(match => match.node);
+        const primary = node ?? withPort[0] ?? matches[0];
+        const port = primary.port ?? (withPort[0]?.port ?? null);
+        out.set(name, {
+            port,
+            pid: primary.pid,
+            // A launcher is only ever a shim/wrapper process (cmd/bash), never
+            // another real node instance — killing that would stop a second,
+            // independently running instance of the same profile.
+            launchers: matches
+                .filter(match => match.pid !== primary.pid && !match.node)
+                .map(match => match.pid),
+        });
+    }
+    return out;
+}
+/**
+ * Prepend the tool directories the host relies on (the resolved dsh dir when
+ * it was found outside PATH, plus the running node's dir) to PATH inside a
+ * POSIX terminal command. Mirrors the Windows shim-dir injection: without
+ * it, a terminal's bash may not have nvm loaded and `dsh`/node fail with
+ * "command not found" — the instance never starts.
+ */
+function commandWithPath(command) {
+    const dirs = [];
+    const tool = resolveCommand('dsh');
+    if (tool.dir !== null)
+        dirs.push(tool.dir);
+    const nodeDir = dirname(process.execPath);
+    if (nodeDir !== tool.dir)
+        dirs.push(nodeDir);
+    const seen = new Set();
+    const unique = dirs.filter(dir => (seen.has(dir) ? false : (seen.add(dir), true)));
+    if (unique.length === 0)
+        return command;
+    return 'export PATH=' + JSON.stringify(unique.join(delimiter) + delimiter + '$PATH') + '; ' + command;
+}
+/**
+ * Open a visible terminal window running `command`. The instance then lives
+ * and dies with that terminal session — the window keeps the instance in
+ * plain sight so the user never forgets a process is running. Linux probes
+ * common emulators; macOS uses Terminal.app via osascript; Windows opens a
+ * cmd window. Returns opened=false when nothing is available.
+ */
+async function openInTerminal(command) {
+    if (process.platform === 'darwin') {
+        const final = commandWithPath(command);
+        spawn('osascript', ['-e', 'tell application "Terminal" to do script "' + final.replace(/"/g, '\\"') + '"'], { stdio: 'ignore' }).unref();
+        return { opened: true, terminal: 'Terminal.app', command: final };
+    }
+    if (process.platform === 'win32') {
+        // A visible cmd window runs the command (`cmd /k` keeps it open).
+        // Two compatibility fixes for the "a cmd window suddenly appears"
+        // reports: windowsHide suppresses the intermediate `start` launcher
+        // window (only the real window shows), and the dsh shim directory is
+        // prepended to PATH so `dsh` resolves inside the new window even when
+        // it is not on the user's PATH (otherwise the window opens with
+        // "'dsh' is not recognized" and the instance never starts).
+        const dshShim = resolveCommand('dsh');
+        const env = { ...process.env };
+        if (dshShim.command !== 'dsh' && dshShim.command !== 'dsh.cmd') {
+            // Same Path/PATH casing tolerance as commandEnv (Explorer-started hosts).
+            const path = env.PATH ?? env.Path ?? env.path ?? '';
+            delete env.Path;
+            delete env.path;
+            env.PATH = dirname(dshShim.command) + (path.length > 0 ? delimiter + path : '');
+        }
+        spawn('cmd', ['/c', 'start', '', 'cmd', '/k', command], { stdio: 'ignore', windowsHide: true, env }).unref();
+        return { opened: true, terminal: 'cmd', command };
+    }
+    // The user's explicit choice, then the system default terminal selector
+    // (x-terminal-emulator / update-alternatives), then common emulators.
+    const envTerminal = process.env.TERMINAL?.trim();
+    const candidates = [
+        ...(envTerminal !== undefined && envTerminal.length > 0 ? [envTerminal.split(/\s+/)[0]] : []),
+        'x-terminal-emulator', 'gnome-terminal', 'konsole', 'xterm', 'kitty', 'alacritty', 'wezterm',
+    ];
+    const final = commandWithPath(command);
+    for (const bin of candidates) {
+        if (!hasBinary(bin))
+            continue;
+        const argv = terminalArgs(bin, final);
+        try {
+            spawn(bin, argv, { stdio: 'ignore', windowsHide: true }).unref();
+            return { opened: true, terminal: bin, command: final };
+        }
+        catch {
+            /* try the next emulator */
+        }
+    }
+    return { opened: false };
+}
+/** Whether a binary exists on PATH (where on Windows, which elsewhere). */
+function hasBinary(bin) {
+    try {
+        execFileSync(process.platform === 'win32' ? 'where' : 'which', [bin], { stdio: 'ignore', windowsHide: true });
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/** Terminal-emulator specific argv for running one command and keeping the window. */
+function terminalArgs(bin, command) {
+    const body = ['bash', '-c', command + '; echo; read -p "Press Enter to close..."'];
+    switch (bin) {
+        case 'gnome-terminal': return ['--', ...body];
+        case 'wezterm': return ['start', '--', ...body];
+        case 'konsole':
+        case 'x-terminal-emulator':
+        case 'xterm':
+        case 'alacritty': return ['-e', ...body];
+        default: return body;
+    }
+}
+/** Find the first free port from `start` upward. */
+async function findFreePort(start) {
+    for (let port = start; port < start + 200; port += 1) {
+        const free = await new Promise((resolve) => {
+            const server = createServer();
+            server.once('error', () => resolve(false));
+            server.listen(port, '127.0.0.1', () => server.close(() => resolve(true)));
+        });
+        if (free)
+            return port;
+    }
+    throw new Error('no free port found');
+}
+/** Whether a TCP port accepts connections. */
+function probePort(port) {
+    return new Promise((resolve) => {
+        const socket = connect(port, '127.0.0.1');
+        const done = (ok) => {
+            socket.destroy();
+            resolve(ok);
+        };
+        socket.once('connect', () => done(true));
+        socket.once('error', () => done(false));
+    });
+}
+/** Marketplace snapshot TTL and cache format version. */
+const MARKETPLACE_TTL = 24 * 60 * 60 * 1000;
+const MARKETPLACE_CACHE_VERSION = 3;
+/**
+ * In-process marketplace mirror: the merged listing is profile-independent,
+ * so profile switches (which only recompute installed flags) read this
+ * instead of the ~1.7MB disk file. TTL mirrors the disk cache; invalidated
+ * on every fresh fetch (writeCache).
+ */
+let marketplaceMemoryCache = null;
+/** Serialization tail for concurrent marketplace refreshes (audit M13). */
+let marketplaceRefreshTail = Promise.resolve();
+/**
+ * Negative-cache TTL: after a total source failure the failure reason is
+ * served from disk instead of re-running the full GitHub round-trip on
+ * every page visit (the reason is typically environmental — proxy or
+ * network — and will not change within minutes).
+ */
+const MARKETPLACE_FAILURE_TTL = 5 * 60 * 1000;
+/** The maintained awesome-dsh-plugins catalog (structured source of truth). */
+const CATALOG_OWNER = 'AdamPlatin123';
+const CATALOG_REPO = 'awesome-dsh-plugins';
+const CATALOG_BRANCH = 'main';
+const CATALOG_RAW = `https://raw.githubusercontent.com/${CATALOG_OWNER}/${CATALOG_REPO}/${CATALOG_BRANCH}`;
+const CATALOG_API = `https://api.github.com/repos/${CATALOG_OWNER}/${CATALOG_REPO}`;
+const GITHUB_UA = { 'user-agent': 'dsh-web-plugin-manager' };
+/** Derive the marketplace status label from a catalog entry. */
+function catalogStatus(entry) {
+    const curation = typeof entry.curation?.state === 'string' ? entry.curation.state : '';
+    const lifecycle = typeof entry.lifecycle?.state === 'string' ? entry.lifecycle.state : '';
+    if (lifecycle === 'archived')
+        return 'archived';
+    if (lifecycle === 'deleted')
+        return 'deleted';
+    if (curation === 'listed')
+        return '✅ listed';
+    if (curation === 'candidate')
+        return '待测';
+    return curation.length > 0 ? curation : '';
+}
+/**
+ * Fetch the structured catalog: enumerate catalog/plugins/*.json via the
+ * GitHub contents API (one call), honour catalog/tombstones.json, and parse
+ * each entry against the published plugin.schema.json shape. Returns an
+ * empty array only when nothing usable could be read.
+ */
+async function fetchCatalogItems() {
+    const listingResponse = await marketplaceFetch(CATALOG_API + '/contents/catalog/plugins?per_page=100', { headers: GITHUB_UA });
+    if (!listingResponse.ok)
+        throw new Error('catalog listing HTTP ' + listingResponse.status);
+    const listing = await listingResponse.json();
+    const files = listing.filter((entry) => typeof entry.name === 'string' && entry.name.endsWith('.json') && typeof entry.download_url === 'string');
+    if (files.length === 0)
+        throw new Error('catalog listing is empty');
+    // Tombstoned ids are blocked from reappearing (policy.readd_policy).
+    const tombstoned = new Set();
+    try {
+        const tombResponse = await marketplaceFetch(CATALOG_RAW + '/catalog/tombstones.json', { headers: GITHUB_UA });
+        if (tombResponse.ok) {
+            const tomb = await tombResponse.json();
+            if (Array.isArray(tomb.entries)) {
+                for (const entry of tomb.entries) {
+                    const id = typeof entry === 'string' ? entry : entry.id;
+                    if (typeof id === 'string')
+                        tombstoned.add(id);
+                }
+            }
+        }
+    }
+    catch { /* tombstones are advisory */ }
+    const seen = new Map();
+    for (const file of files) {
+        try {
+            const response = await marketplaceFetch(file.download_url, { headers: GITHUB_UA });
+            if (!response.ok)
+                continue;
+            const entry = await response.json();
+            const id = typeof entry.id === 'string' ? entry.id : '';
+            if (id.length > 0 && tombstoned.has(id))
+                continue;
+            const curation = typeof entry.curation?.state === 'string' ? entry.curation.state : '';
+            if (curation === 'rejected' || curation === 'removed' || curation === 'blocked')
+                continue;
+            const lifecycle = typeof entry.lifecycle?.state === 'string' ? entry.lifecycle.state : '';
+            if (lifecycle === 'deleted')
+                continue;
+            const fullName = typeof entry.repository?.full_name === 'string' ? entry.repository.full_name : '';
+            const url = typeof entry.repository?.url === 'string' ? entry.repository.url : '';
+            if (fullName.length === 0 || url.length === 0)
+                continue;
+            if (fullName.startsWith('deepseek-ai/'))
+                continue;
+            const packageName = typeof entry.package?.name === 'string' ? entry.package.name : '';
+            const category = typeof entry.curation?.category === 'string' ? entry.curation.category : '';
+            const description = typeof entry.curation?.description_zh === 'string' ? entry.curation.description_zh : '';
+            const status = catalogStatus(entry);
+            const item = {
+                name: fullName,
+                displayName: fullName.split('/').pop() ?? fullName,
+                ...(description.length > 0 ? { description } : {}),
+                stars: 0,
+                updatedAt: '',
+                createdAt: '',
+                url,
+                status,
+                installed: false,
+                updateAvailable: false,
+                ...(packageName.length > 0 ? { packageName } : {}),
+                ...(category.length > 0 ? { category } : {}),
+                ...(lifecycle.length > 0 ? { lifecycle } : {}),
+            };
+            // Deduplicate by repository; a verified listing wins over a candidate.
+            const existing = seen.get(fullName);
+            const verified = (value) => (value?.status ?? '').includes('✅');
+            if (existing === undefined || (verified(item) && !verified(existing))) {
+                seen.set(fullName, item);
+            }
+        }
+        catch { /* skip one broken entry */ }
+    }
+    if (seen.size === 0)
+        throw new Error('no usable entries parsed from the catalog');
+    return [...seen.values()];
+}
+/**
+ * Fallback source: parse the human-curated PLUGINS.md table
+ * (| name | [org/repo](url) | description | status |), tracking the current
+ * category section and deduplicating by repository (✅ wins over 待测).
+ */
+async function fetchMarkdownItems() {
+    const mdResponse = await marketplaceFetch(CATALOG_RAW + '/PLUGINS.md', { headers: GITHUB_UA });
+    if (!mdResponse.ok)
+        throw new Error('catalog fetch HTTP ' + mdResponse.status);
+    const markdown = await mdResponse.text();
+    const rows = [];
+    let category = '';
+    for (const line of markdown.split('\n')) {
+        const section = /^##\s+(.*)$/.exec(line);
+        if (section !== null) {
+            // Strip the leading category emoji (🔌 / 🧰 / 🎓 / …).
+            category = section[1].trim().replace(/^\S+\s*/, '');
+            continue;
+        }
+        const match = /^\|\s*([^|]+?)\s*\|\s*\[([^|]+?)\]\(https?:\/\/github\.com\/([^/)]+\/[^/)]+)\)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|/.exec(line);
+        if (match === null)
+            continue;
+        const fullName = match[3].trim();
+        if (fullName.length === 0 || fullName.startsWith('deepseek-ai/'))
+            continue;
+        rows.push({
+            fullName,
+            description: match[4].trim(),
+            status: match[5].trim(),
+            category,
+        });
+    }
+    if (rows.length === 0)
+        throw new Error('no rows parsed from PLUGINS.md');
+    const byName = new Map();
+    const score = (status) => status.includes('✅') ? 2 : status.includes('已测') ? 1 : 0;
+    for (const row of rows) {
+        const existing = byName.get(row.fullName);
+        if (existing === undefined || score(row.status) > score(existing.status)) {
+            byName.set(row.fullName, row);
+        }
+    }
+    return [...byName.entries()].map(([fullName, row]) => ({
+        name: fullName,
+        displayName: fullName.split('/').pop() ?? fullName,
+        ...(row.description.length > 0 ? { description: row.description } : {}),
+        stars: 0,
+        updatedAt: '',
+        createdAt: '',
+        url: 'https://github.com/' + fullName,
+        status: row.status,
+        installed: false,
+        updateAvailable: false,
+        ...(row.category.length > 0 ? { category: row.category } : {}),
+    }));
+}
+/**
+ * Merge the two sources into one listing: catalog entries keep their
+ * structure (package name, lifecycle) and are enriched with the curated
+ * description / evidence status / category from PLUGINS.md when present;
+ * PLUGINS.md-only repositories are appended. Deduplication is by repository.
+ */
+function mergeMarketplace(catalog, markdown) {
+    const mdBy = new Map(markdown.map(item => [item.name, item]));
+    const out = [];
+    const seen = new Set();
+    for (const item of catalog) {
+        const md = mdBy.get(item.name);
+        out.push(md !== undefined ? {
+            ...item,
+            ...(item.description === undefined && md.description !== undefined ? { description: md.description } : {}),
+            // A verified evidence status wins over a plain auto-discovered candidate.
+            ...((item.status === undefined || item.status.length === 0 || item.status === '待测') && md.status !== undefined ? { status: md.status } : {}),
+            ...(item.category === undefined && md.category !== undefined ? { category: md.category } : {}),
+        } : item);
+        seen.add(item.name);
+    }
+    for (const item of markdown) {
+        if (!seen.has(item.name))
+            out.push(item);
+    }
+    return out;
+}
+/**
+ * Enrich items with GitHub repository metadata (stars/dates). Unauthenticated
+ * API quota is 60/h: on 403/429 enrichment stops and the remaining items
+ * reuse metadata from the previous snapshot (zeros when unknown) — the list
+ * itself is never dropped because of a rate limit.
+ */
+async function enrichRepos(items, prior) {
+    let rateLimited = false;
+    const out = [];
+    for (const item of items) {
+        if (rateLimited) {
+            const prev = prior.get(item.name);
+            out.push(prev !== undefined
+                ? { ...item, stars: prev.stars, updatedAt: prev.updatedAt, createdAt: prev.createdAt }
+                : item);
+            continue;
+        }
+        try {
+            const response = await marketplaceFetch('https://api.github.com/repos/' + item.name, { headers: GITHUB_UA });
+            if (response.status === 403 || response.status === 429) {
+                rateLimited = true;
+                const prev = prior.get(item.name);
+                out.push(prev !== undefined
+                    ? { ...item, stars: prev.stars, updatedAt: prev.updatedAt, createdAt: prev.createdAt }
+                    : item);
+                continue;
+            }
+            if (response.ok) {
+                const repo = await response.json();
+                out.push({
+                    ...item,
+                    stars: typeof repo.stargazers_count === 'number' ? repo.stargazers_count : 0,
+                    updatedAt: typeof repo.updated_at === 'string' ? repo.updated_at : '',
+                    createdAt: typeof repo.created_at === 'string' ? repo.created_at : '',
+                });
+            }
+            else {
+                out.push(item);
+            }
+        }
+        catch {
+            out.push(item);
+        }
+    }
+    return out;
+}
+/** Identity of a git-cache clone dir (mirrors prepareInstallSource naming: github.com-owner-repo). */
+function gitCacheIdentity(source) {
+    // The clone cache strips a trailing .git from the dir name
+    // (prepareInstallSource) — the identity must too, or the installed
+    // detection misses `git+https://…repo.git` sources (audit).
+    const match = /github\.com[-/]([^/\s]+?)[-/]([^/\s]+?)(?:\.git)?$/i.exec(source);
+    return match !== null ? `github.com-${match[1].toLowerCase()}-${match[2].toLowerCase()}` : null;
+}
+/** Lowercase directory-entry set of one directory (empty when missing). */
+function dirNameSet(dir) {
+    try {
+        const out = new Set();
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+            if (entry.isDirectory())
+                out.add(entry.name.toLowerCase());
+        }
+        return out;
+    }
+    catch {
+        return new Set();
+    }
+}
+/**
+ * Lightweight semver comparison (v1.2.3-rc.1 < v1.2.3; rc.10 > rc.9;
+ * 1.0 / 1 count as 1.0.0). Returns -1/0/1; falls back to string comparison
+ * when a version does not parse.
+ */
+function compareVersions(a, b) {
+    const parse = (v) => {
+        const s = v.trim().replace(/^v/i, '');
+        const m = /^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?$/.exec(s);
+        if (m === null)
+            return null;
+        return {
+            major: Number(m[1]),
+            minor: m[2] === undefined ? 0 : Number(m[2]),
+            patch: m[3] === undefined ? 0 : Number(m[3]),
+            pre: m[4] ?? null,
+        };
+    };
+    const pa = parse(a);
+    const pb = parse(b);
+    if (pa === null || pb === null)
+        return a === b ? 0 : a < b ? -1 : 1;
+    for (const key of ['major', 'minor', 'patch']) {
+        if (pa[key] !== pb[key])
+            return pa[key] < pb[key] ? -1 : 1;
+    }
+    // Prerelease ordering: no pre > any pre; numeric ids > alphanumeric ids.
+    if (pa.pre === pb.pre)
+        return 0;
+    if (pa.pre === null)
+        return 1;
+    if (pb.pre === null)
+        return -1;
+    const paParts = pa.pre.split('.');
+    const pbParts = pb.pre.split('.');
+    for (let i = 0; i < Math.max(paParts.length, pbParts.length); i++) {
+        const x = paParts[i] ?? '';
+        const y = pbParts[i] ?? '';
+        if (x === y)
+            continue;
+        const xn = /^\d+$/.test(x);
+        const yn = /^\d+$/.test(y);
+        if (xn && yn)
+            return Number(x) < Number(y) ? -1 : 1;
+        if (xn)
+            return 1;
+        if (yn)
+            return -1;
+        return x < y ? -1 : 1;
+    }
+    return 0;
+}
+/** One registry-index entry in the wire MarketplaceItem shape. */
+function registryToItem(repo) {
+    return {
+        name: repo.full_name,
+        displayName: repo.name,
+        ...(repo.description !== null && repo.description.length > 0 ? { description: repo.description } : {}),
+        stars: repo.stargazers_count,
+        updatedAt: repo.updated_at,
+        createdAt: '',
+        url: repo.html_url.length > 0 ? repo.html_url : 'https://github.com/' + repo.full_name,
+        ...(functionalTopics(repo.topics).length > 0 ? { topics: functionalTopics(repo.topics) } : {}),
+        ...(repo.pkg_name !== undefined ? { packageName: repo.pkg_name } : {}),
+        ...(repo.version !== undefined ? { latestVersion: repo.version } : {}),
+        ...(repo.category !== undefined ? { category: repo.category } : {}),
+        installed: false,
+        updateAvailable: false,
+    };
+}
+/**
+ * Merge the curated layer (catalog + PLUGINS.md) onto the registry base:
+ * curated status / description / category / packageName / lifecycle win on
+ * conflicts, and curated-only repositories are appended.
+ */
+function mergeRegistryWithCurated(registry, curated) {
+    const by = new Map(curated.map(item => [item.name, item]));
+    const out = [];
+    const seen = new Set();
+    for (const repo of registry) {
+        const item = registryToItem(repo);
+        const curatedItem = by.get(repo.full_name);
+        if (curatedItem !== undefined) {
+            out.push({
+                ...item,
+                ...(curatedItem.description !== undefined && item.description === undefined ? { description: curatedItem.description } : {}),
+                // A verified evidence status wins over an unverified registry entry.
+                ...((item.status === undefined || item.status.length === 0 || item.status === '待测') && curatedItem.status !== undefined ? { status: curatedItem.status } : {}),
+                ...(item.category === undefined && curatedItem.category !== undefined ? { category: curatedItem.category } : {}),
+                ...(item.packageName === undefined && curatedItem.packageName !== undefined ? { packageName: curatedItem.packageName } : {}),
+                ...(curatedItem.lifecycle !== undefined ? { lifecycle: curatedItem.lifecycle } : {}),
+            });
+        }
+        else {
+            out.push(item);
+        }
+        seen.add(repo.full_name);
+    }
+    for (const item of curated) {
+        if (!seen.has(item.name)) {
+            out.push(item);
+            seen.add(item.name);
+        }
+    }
+    return out;
+}
+/** Build the installed index for one profile; null when the profile is unusable. */
+function buildInstalledIndex(profile) {
+    if (profile.length === 0 || !isSafeProfileName(profile))
+        return null;
+    const dir = profileDir(profile);
+    if (!existsSync(dir))
+        return null;
+    const manifest = readManifest(dir);
+    const deps = manifest.dependencies ?? {};
+    const packageVersions = new Map();
+    const repoVersions = new Map();
+    const gitVersions = new Map();
+    for (const name of Object.keys(deps)) {
+        const info = readPackageInfo(dir, name);
+        const version = info.version ?? '';
+        packageVersions.set(name.toLowerCase(), version);
+        if (info.repository !== undefined) {
+            const ref = normalizeRepoRef(info.repository);
+            if (ref !== null)
+                repoVersions.set(ref, version);
+        }
+        const source = deps[name];
+        if (source !== undefined) {
+            const identity = gitCacheIdentity(source);
+            if (identity !== null)
+                gitVersions.set(identity, version);
+        }
+    }
+    return {
+        packageVersions,
+        repoVersions,
+        gitVersions,
+        skills: dirNameSet(join(dshHome(), 'skills')),
+        presets: dirNameSet(join(dshHome(), '.agent-presets')),
+    };
+}
+/**
+ * Detect whether one marketplace item is installed in the profile:
+ * 0. kind install records (marketplace-installed skills/presets/plugins);
+ * 1. repository identity (bidirectional — package name may differ from repo);
+ * 2. package name (registry pkg_name or repo basename — the common npm==repo);
+ * 3. git-cache clone identity (link:<plugin-manager-src>/github.com-o-r);
+ * 4. skills / agent-presets directories (~/.dsh/skills|.agent-presets/<slug>).
+ * Update availability compares the installed version against the registry
+ * index version (CI-fetched from the repo's package.json) — strictly newer
+ * only, so repo rollbacks never report a false update.
+ */
+function flagItemInstalled(item, index, records) {
+    if (index === null)
+        return { ...item, installed: false, updateAvailable: false };
+    let installed = false;
+    let version;
+    let installedKind;
+    const hit = (found, hitVersion) => {
+        if (!found)
+            return;
+        installed = true;
+        if (version === undefined && hitVersion !== undefined && hitVersion.length > 0)
+            version = hitVersion;
+    };
+    // 0. install records (marketplace-installed of any kind)
+    const record = records.get(item.name.toLowerCase());
+    if (record !== undefined) {
+        installed = true;
+        installedKind = record.type;
+        if (record.version !== null && record.version.length > 0)
+            version = record.version;
+    }
+    // 1. repository identity
+    const repoRef = item.name.toLowerCase();
+    hit(index.repoVersions.has(repoRef), index.repoVersions.get(repoRef));
+    // 2. package name
+    const candidates = new Set();
+    if (item.packageName !== undefined && item.packageName.length > 0)
+        candidates.add(item.packageName.toLowerCase());
+    candidates.add(item.displayName.toLowerCase());
+    for (const candidate of candidates) {
+        hit(index.packageVersions.has(candidate), index.packageVersions.get(candidate));
+    }
+    // 3. git-cache clone identity
+    const gitId = `github.com-${item.name.toLowerCase().replace('/', '-')}`;
+    hit(index.gitVersions.has(gitId), index.gitVersions.get(gitId));
+    // 4. skills / presets directories
+    const slug = slugDirName(item.displayName);
+    if (index.skills.has(slug) || index.presets.has(slug))
+        hit(true);
+    const updateAvailable = installed
+        && version !== undefined
+        && item.latestVersion !== undefined
+        && compareVersions(version, item.latestVersion) < 0;
+    return {
+        ...item,
+        installed,
+        ...(version !== undefined ? { installedVersion: version } : {}),
+        ...(installedKind !== undefined ? { installedKind } : {}),
+        updateAvailable,
+    };
+}
+/**
+ * Flag every item with a bounded worker pool (registry lists can reach
+ * thousands of entries; serial stat/read would stall the first paint).
+ */
+async function flagMarketplaceItems(items, profile) {
+    await pruneGhostRecords();
+    const index = buildInstalledIndex(profile);
+    const records = await loadKindRecords();
+    const out = new Array(items.length);
+    const workers = Math.min(12, items.length);
+    let cursor = 0;
+    const worker = async () => {
+        while (cursor < items.length) {
+            const idx = cursor++;
+            out[idx] = flagItemInstalled(items[idx], index, records);
+        }
+    };
+    await Promise.all(Array.from({ length: workers }, () => worker()));
+    return out;
+}
+/** Overlay the dsh.so verification/security metadata onto the listing. */
+function overlayDshSo(items, dshSo) {
+    if (dshSo === null || dshSo.length === 0)
+        return [...items];
+    // dsh.so keys entries by the repo basename (no owner segment), so a
+    // basename shared by several owners (alice/tools vs bob/tools) cannot be
+    // attributed safely — skip the overlay for duplicated basenames instead of
+    // mis-tagging one owner with the other's metadata (audit).
+    const nameCounts = new Map();
+    for (const item of items) {
+        const key = item.displayName.toLowerCase();
+        nameCounts.set(key, (nameCounts.get(key) ?? 0) + 1);
+    }
+    const byName = new Map(dshSo.map(entry => [entry.name.toLowerCase(), entry]));
+    return items.map(item => {
+        const key = item.displayName.toLowerCase();
+        if (nameCounts.get(key) !== 1)
+            return item;
+        const overlay = byName.get(key);
+        if (overlay === undefined)
+            return item;
+        return {
+            ...item,
+            ...(overlay.verification !== undefined
+                ? { verification: { level: overlay.verification.level, label: overlay.verification.label } }
+                : {}),
+            ...(overlay.security !== undefined
+                ? { security: { riskLevel: overlay.security.riskLevel, status: overlay.security.status } }
+                : {}),
+        };
+    });
+}
+/**
+ * Filter out repositories marked as non-installable (detected as neither
+ * plugin nor skill nor preset). Applied to every listing path — the 24h
+ * cache, fresh fetches and the last-resort cache all go through the same
+ * filter, so a blocked repo stays hidden until explicitly unblocked.
+ */
+function filterBlockedRepos(items, blocked) {
+    if (blocked.size === 0)
+        return [...items];
+    return items.filter(item => !blocked.has(normalizeRepoRef(item.name) ?? item.name));
+}
+/** Blocked-repo summary carried on every listing response. */
+function blockedMeta(blocked) {
+    return blocked.size > 0
+        ? { blocked: blocked.size, blockedRepos: [...blocked].slice(0, 20) }
+        : {};
+}
+/**
+ * Same-package deduplication: the same npm package cannot be installed
+ * twice, so entries sharing a pkg_name collapse to one — the installed one
+ * wins (including manually installed low-star repos), otherwise the
+ * higher-star entry. The dropped count is surfaced to the client.
+ */
+function dedupeMarketplace(items) {
+    const rank = (item) => (item.installed ? 1e12 : 0) + item.stars;
+    const byKey = new Map();
+    let dropped = 0;
+    for (const item of items) {
+        const key = item.packageName !== undefined && item.packageName.length > 0
+            ? 'pkg:' + item.packageName.toLowerCase()
+            : 'repo:' + item.name.toLowerCase();
+        const prev = byKey.get(key);
+        if (prev === undefined) {
+            byKey.set(key, item);
+            continue;
+        }
+        if (rank(item) > rank(prev))
+            byKey.set(key, item);
+        dropped++;
+    }
+    return { items: [...byKey.values()], dropped };
+}
+/** Loader random-mount ids are 8-hex (Math.random().toString(16).slice(2, 10)). */
+function isStableRowId(id) {
+    return !/^[0-9a-f]{8}$/.test(id);
+}
+/** Map a fiber state number to the wire phase label. */
+function phaseOf(state) {
+    if (state === undefined)
+        return null;
+    if (state === 0)
+        return 'pending';
+    if (state === 1)
+        return 'loading';
+    if (state === 2)
+        return 'active';
+    if (state === 3)
+        return 'failed';
+    if (state === 4)
+        return null;
+    return 'unloading';
+}
+/** Read the live include-tree rows with their fiber states and errors. */
+function liveRowStates(ctx) {
+    const loader = ctx.get('loader');
+    if (loader === undefined)
+        return [];
+    for (const entry of loader.entries()) {
+        if (entry.id !== 'include')
+            continue;
+        const out = [];
+        for (const row of entry.subtree?.entries() ?? []) {
+            const options = row.options;
+            if (options === undefined || options.id === undefined || options.group)
+                continue;
+            let error;
+            try {
+                const fiberError = row.fiber?._error;
+                if (fiberError?.message !== undefined && typeof fiberError.message === 'string')
+                    error = fiberError.message;
+            }
+            catch { /* error extraction is best-effort */ }
+            out.push({
+                entryId: options.id,
+                moduleName: options.name ?? '',
+                enabled: !row.disabled,
+                phase: phaseOf(row.fiber?.state),
+                ...(error !== undefined ? { error } : {}),
+            });
+        }
+        return out;
+    }
+    return [];
+}
+/**
+ * Offline entry view for profiles that are not running: the bundle layer
+ * stack and the managed insert rows, all configured-but-not-live. The live
+ * loader tree cannot be used for them (it belongs to the running profile).
+ * Official in-box bundles (base/web-app/headless) are NOT user-installed
+ * plugins — the catalog's "installed" filter must not show them.
+ */
+function offlineEntries(bundles, insertRows) {
+    const out = bundles.map((bundle) => ({
+        entryId: bundle,
+        moduleName: bundle,
+        enabled: true,
+        fiberPhase: null,
+        installed: !IN_BOX_BUNDLES.includes(bundle),
+        modified: false,
+        unmounted: false,
+    }));
+    for (const row of insertRows) {
+        out.push({
+            entryId: row.id,
+            moduleName: row.name,
+            enabled: true,
+            fiberPhase: null,
+            installed: true,
+            modified: row.managed,
+            unmounted: false,
+        });
+    }
+    return out;
+}
+/**
+ * Read the composed include-tree rows as the stable runtime view. Loader
+ * entry ids are random per mount, so patch targeting must use the include
+ * row id (EntryOptions.id — stable across reloads by official semantics).
+ * Random-mount rows (no explicit id) keep their random id and are excluded
+ * from patch-targetable operations by the UI (isStableRowId).
+ */
+function includeRows(ctx, installed) {
+    const loader = ctx.get('loader');
+    if (loader === undefined)
+        return [];
+    for (const entry of loader.entries()) {
+        if (entry.id !== 'include')
+            continue;
+        // Deduplicate by include row id: config-HMR refresh generations can leave
+        // both the patched row (configured disabled, unmounted) and the stale
+        // mounted row in the tree. Prefer the configured state (disabled), then a
+        // live fiber, then the first occurrence — the loader itself never mounts
+        // two rows with the same id, so one entry per id is the authoritative view.
+        const seen = new Map();
+        const authority = (row) => (row.enabled ? 0 : 2) + (row.fiberPhase === null ? 0 : 1);
+        for (const row of entry.subtree?.entries() ?? []) {
+            const options = row.options;
+            if (options === undefined || options.id === undefined || options.group)
+                continue;
+            const name = options.name ?? '';
+            const candidate = {
+                entryId: options.id,
+                moduleName: name,
+                enabled: !row.disabled,
+                fiberPhase: phaseOf(row.fiber?.state),
+                installed: installed.packageNames.has(name)
+                    || installed.insertNames.has(name)
+                    || installed.insertIds.has(options.id),
+                modified: installed.managedIds.has(options.id),
+                unmounted: false,
+            };
+            const current = seen.get(options.id);
+            if (current === undefined || authority(candidate) > authority(current)) {
+                seen.set(options.id, candidate);
+            }
+        }
+        return [...seen.values()];
+    }
+    return [];
+}
+/** Read a package's manifest metadata (version, repository) and install time. */
+function readPackageInfo(dir, name) {
+    const pkgPath = join(dir, 'node_modules', name, 'package.json');
+    try {
+        const manifest = JSON.parse(readFileSync(pkgPath, 'utf8'));
+        let repository;
+        if (typeof manifest.repository === 'string')
+            repository = manifest.repository;
+        else if (typeof manifest.repository === 'object' && manifest.repository !== null) {
+            const url = manifest.repository.url;
+            if (typeof url === 'string')
+                repository = url;
+        }
+        if (repository === undefined && typeof manifest.homepage === 'string')
+            repository = manifest.homepage;
+        // The value lands in an <a href>: only http(s) (and git+https for
+        // repository fields) may pass — anything else (javascript:, data:) is
+        // dropped to keep a hostile manifest from scripting the settings page
+        // (audit M17).
+        if (repository !== undefined && !/^(https?:\/\/|git\+https?:\/\/)/i.test(repository))
+            repository = undefined;
+        // Install time: the node_modules link mtime (written when pnpm added it).
+        let installedAt;
+        try {
+            installedAt = statSync(join(dir, 'node_modules', name)).mtime.toISOString();
+        }
+        catch {
+            installedAt = undefined;
+        }
+        return {
+            ...(typeof manifest.version === 'string' ? { version: manifest.version } : {}),
+            ...(installedAt !== undefined ? { installedAt } : {}),
+            ...(repository !== undefined ? { repository } : {}),
+        };
+    }
+    catch {
+        return {};
+    }
+}
+/**
+ * Resolve the real package name after an install: pnpm writes the package's
+ * own name as the dependency key, while the requested source may have been a
+ * path/git/tarball locator. Exact match first, then a dependency value
+ * containing the source string.
+ */
+function resolveInstalledName(profile, source) {
+    const manifest = readManifest(profileDir(profile));
+    const deps = manifest.dependencies ?? {};
+    if (typeof deps[source] === 'string')
+        return source;
+    // Windows: the caller's source is a backslash path (clone cache) while pnpm
+    // writes forward slashes (link:C:/Users/...) — compare both forms or the
+    // match fails and the quality gate + insert-row mount are silently skipped.
+    // Comparisons are case-insensitive on Windows: a case-mismatched path must
+    // not silently skip the quality gate (audit W3).
+    const ci = process.platform === 'win32';
+    const eq = (a, b) => ci ? a.toLowerCase() === b.toLowerCase() : a === b;
+    const inc = (a, b) => ci ? a.toLowerCase().includes(b.toLowerCase()) : a.includes(b);
+    const normalized = source.replace(/\\/g, '/');
+    const hit = Object.keys(deps).find(key => eq(deps[key], source) || (deps[key] !== undefined && inc(deps[key], source))
+        || (normalized !== source && (eq(deps[key], normalized) || (deps[key] !== undefined && inc(deps[key], normalized)))));
+    return hit ?? null;
+}
+/** Whether an installed package declares dsh.bundle (bundle-plugin shape). */
+function exportsBundlePatch(profile, packageName) {
+    try {
+        const manifest = JSON.parse(readFileSync(join(profileDir(profile), 'node_modules', packageName, 'package.json'), 'utf8'));
+        return manifest.dsh?.bundle?.patch !== undefined;
+    }
+    catch {
+        return false;
+    }
+}
+/** Turn a package name into a safe insert-row id (scope slash → dash). */
+function slugify(name) {
+    return name.replace(/^@/, '').replace(/[^a-z0-9-]/gi, '-').toLowerCase();
+}
+/**
+ * Remove managed insert rows whose package was just removed from the
+ * profile. A leftover insert row would fail to import on the next boot
+ * (the package directory is gone) — the bug that took the instance down
+ * during V2 testing.
+ */
+function cleanupInsertRows(ctx, profile, packageName) {
+    try {
+        const dir = profileDir(profile);
+        const current = readPatch(dir);
+        const rows = readInsertRows(current);
+        const ops = [];
+        let next = current;
+        for (const row of rows) {
+            if (!row.managed || row.name !== packageName)
+                continue;
+            const result = removeInsertRow(next, row.id);
+            if (result.removed) {
+                next = result.content;
+                ops.push({ kind: 'remove-first', value: { insert: [{ id: row.id, name: row.name }] } });
+            }
+        }
+        if (ops.length > 0 && ctx !== null && profile === hostProfileName())
+            void applyLiveOps(ctx, ops);
+        if (next !== current)
+            writePatch(patchPath(dir), next);
+    }
+    catch {
+        /* patch cleanup is best-effort */
+    }
+}
+/** Read the current bundle list of a profile. */
+function readBundles(profile) {
+    const manifest = readManifest(profileDir(profile));
+    const dsh = (manifest['dsh'] ?? {});
+    const profileManifest = (dsh['profile'] ?? {});
+    const bundles = Array.isArray(profileManifest['bundles']) ? profileManifest['bundles'] : [];
+    return [...bundles];
+}
+/** Official built-in profiles the environment manager never touches. */
+const OFFICIAL_PROFILES = ['web', 'headless'];
+/** Whether a profile name is an official built-in. */
+function isOfficialProfile(name) {
+    return OFFICIAL_PROFILES.includes(name);
+}
+/**
+ * The name of the profile hosting this running instance, or null when it
+ * cannot be determined safely.
+ *
+ * Sources, in order:
+ *   1. the --profile <name> flag in the launch argv (explicit, official);
+ *   2. the subcommand form (dsh web / dsh headless) - searched ONLY past
+ *      argv[0..1] (node executable + script path): an nvm/volta install
+ *      makes the script a symlink named dsh, so argv[1] is the binary's
+ *      own path; scanning the whole argv would take it as the profile name
+ *      and crash the boot with an unsafe-profile-name error (issue #1);
+ *   3. the plugin's own install location (<profile>/node_modules/
+ *      dsh-web-plugin-manager, npm/yarn layouts) as a last resort.
+ *
+ * Any candidate that is not a safe profile name yields null - the caller
+ * (apply) treats null as "no host", never crashing the plugin tree.
+ */
+function hostProfileName() {
+    try {
+        const argv = process.argv;
+        const flagIndex = argv.indexOf('--profile');
+        if (flagIndex >= 0 && argv[flagIndex + 1] !== undefined) {
+            const flagged = argv[flagIndex + 1];
+            return isSafeProfileName(flagged) ? flagged : null;
+        }
+        // dsh web / dsh headless command mode (no --profile flag): only the
+        // args after the node executable and the script path are candidates.
+        const candidate = argv.slice(2).find(arg => !arg.startsWith('-') && !arg.endsWith('bin.js') && !arg.includes('node'));
+        if (candidate !== undefined && isSafeProfileName(candidate))
+            return candidate;
+        // Last resort: derive the hosting profile from the install location
+        // (npm/yarn keep <profile>/node_modules/<pkg>; pnpm/link installs
+        // resolve elsewhere and simply yield null here).
+        return locationProfileName();
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Derive the hosting profile from the plugin's module location: the first
+ * ancestor directory whose package.json is named dsh-profile-<basename>
+ * (the official and createProfile naming). null when not found (pnpm and
+ * link: installs resolve outside the profile tree).
+ */
+function locationProfileName() {
+    let dir = dirname(fileURLToPath(import.meta.url));
+    for (let depth = 0; depth < 10; depth += 1) {
+        if (isSafeProfileName(basename(dir))) {
+            try {
+                const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
+                if (manifest.name === 'dsh-profile-' + basename(dir))
+                    return basename(dir);
+            }
+            catch { /* not a manifest level: keep walking */ }
+        }
+        const parent = dirname(dir);
+        if (parent === dir)
+            return null;
+        dir = parent;
+    }
+    return null;
+}
+/** Whether a profile hosts the running plugin-manager (its dependency). */
+function isHostProfile(name) {
+    // The profile hosting this running instance — renaming or removing it would
+    // break the live process. Other profiles that merely install the plugin
+    // (e.g. via copyPlugins) remain manageable.
+    return hostProfileName() === name;
+}
+/** Official empty patch template for new profiles. */
+const PATCH_TEMPLATE = [
+    "# Your patch layer for this dsh profile, applied after every bundle layer:",
+    "# a top-level YAML array of loader patch entries (id-targeted config",
+    "# overrides, disables, and insert lists; `!!js` expressions allowed).",
+    '[]',
+].join('\n') + '\n';
+/** Hoisted-linker workspace for new profiles (mirrors the official template). */
+const PNPM_WORKSPACE_TEMPLATE = [
+    'packages:',
+    '  - .',
+    '',
+    'nodeLinker: hoisted',
+    'autoInstallPeers: false',
+    '',
+].join('\n');
+/** Installation-owned (in-box) bundles: never dependencies, always layers. */
+const IN_BOX_BUNDLES = [
+    '@deepseek-ai/dsh-base',
+    '@deepseek-ai/dsh-web-app',
+    '@deepseek-ai/dsh-headless',
+];
+/**
+ * `dsh plugin` reconciles bundles from installed dependencies and drops
+ * in-box bundles (base/web-app/headless are installation-owned, not
+ * dependencies). Re-insert only those in-box bundles that existed before.
+ */
+function restoreInBoxBundles(profile, before) {
+    const dir = profileDir(profile);
+    const path = join(dir, 'package.json');
+    const manifest = readManifest(dir);
+    const current = manifest.dsh?.profile?.bundles ?? [];
+    const missing = before.filter((bundle) => IN_BOX_BUNDLES.includes(bundle) && !current.includes(bundle));
+    if (missing.length === 0)
+        return;
+    const next = [...current];
+    for (const bundle of missing) {
+        // Insert after the previous bundle's position to keep the prior order.
+        const beforeIndex = before.indexOf(bundle);
+        const anchor = before[beforeIndex - 1];
+        const at = anchor === undefined ? 0 : next.indexOf(anchor) + 1;
+        next.splice(at, 0, bundle);
+    }
+    manifest.dsh = manifest.dsh ?? {};
+    manifest.dsh.profile = manifest.dsh.profile ?? {};
+    manifest.dsh.profile.bundles = next;
+    writeFileSync(path, JSON.stringify(manifest, null, 2) + '\n');
+}
+/** Read directory entries defensively (missing root → empty). */
+function readdirSafe(path) {
+    try {
+        return readdirSync(path, { withFileTypes: true });
+    }
+    catch {
+        return [];
+    }
+}
+/** Read a JSON request body (bounded). */
+function readJsonBody(req) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        let size = 0;
+        req.on('data', (chunk) => {
+            size += chunk.length;
+            if (size > 1_000_000) {
+                reject(new Error('request body too large'));
+                req.destroy?.();
+            }
+            else
+                chunks.push(chunk);
+        });
+        req.on('end', () => {
+            try {
+                resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'));
+            }
+            catch (error) {
+                reject(error instanceof Error ? error : new Error(String(error)));
+            }
+        });
+        req.on('error', reject);
+    });
+}
+/** Write a JSON response. */
+/** Loopback host literals always trusted (the DSH web UI binds here). */
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', '[::1]', 'localhost']);
+/** Extra trusted Host values via env (comma-separated hostnames / IPs). */
+function extraTrustedHosts() {
+    const raw = process.env.DSH_PLUGIN_MANAGER_TRUSTED_HOSTS ?? '';
+    return new Set(raw.split(',').map(s => s.trim().toLowerCase()).filter(s => s.length > 0));
+}
+/** Hostname part of an authority value (handles IPv6 literals). */
+function hostnameOf(authority) {
+    const s = authority.trim().toLowerCase();
+    if (s.startsWith('[')) {
+        const end = s.indexOf(']');
+        return end >= 0 ? s.slice(0, end + 1) : s;
+    }
+    const colon = s.lastIndexOf(':');
+    return colon >= 0 ? s.slice(0, colon) : s;
+}
+/** Port part of an authority value ('' when absent). */
+function portOf(authority) {
+    const s = authority.trim();
+    if (s.startsWith('[')) {
+        const end = s.indexOf(']');
+        return end >= 0 && s.length > end + 1 && s[end + 1] === ':' ? s.slice(end + 2) : '';
+    }
+    const colon = s.lastIndexOf(':');
+    return colon >= 0 ? s.slice(colon + 1) : '';
+}
+/**
+ * CSRF / DNS-rebinding fence for the REST surface.
+ *  - Host must be loopback or an explicitly trusted host (an attacker domain
+ *    resolving to 127.0.0.1 is refused — the check runs on the Host header,
+ *    which the browser cannot fake cross-origin);
+ *  - a cross-site fetch is refused (Sec-Fetch-Site);
+ *  - when an Origin header is present, its host:port must equal the request's
+ *    Host (a foreign page must not drive mutations); non-browser callers
+ *    (curl, the CLI, same-process tools) carry no Origin and pass.
+ */
+function isTrustedRequest(req) {
+    const rawHost = String(req.headers?.['host'] ?? '');
+    if (rawHost.length === 0)
+        return false;
+    const host = hostnameOf(rawHost);
+    if (!LOOPBACK_HOSTS.has(host) && !extraTrustedHosts().has(host))
+        return false;
+    const secFetch = String(req.headers?.['sec-fetch-site'] ?? '').toLowerCase();
+    if (secFetch === 'cross-site')
+        return false;
+    const origin = String(req.headers?.['origin'] ?? '');
+    if (origin.length === 0)
+        return true;
+    try {
+        const url = new URL(origin);
+        const originPort = url.port === '' ? (url.protocol === 'https:' ? '443' : '80') : url.port;
+        const reqPort = portOf(rawHost) === '' ? '80' : portOf(rawHost);
+        return url.hostname.toLowerCase() === host && originPort === reqPort;
+    }
+    catch {
+        return false;
+    }
+}
+function sendJson(res, status, value) {
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(value));
+}
+/** Mount the REST surface. Returns the route disposers (may be empty). */
+export function registerRoutes(ctx, service) {
+    const webServer = ctx.get('webServer');
+    if (webServer === undefined)
+        return [];
+    const handler = (op) => async (req, res) => {
+        try {
+            // Trust fence (CSRF / DNS-rebinding), mirroring the official /api
+            // trust model: POST + application/json only, and the Host must be
+            // loopback (or an explicitly trusted host). A cross-site page cannot
+            // read responses but can drive mutations — same threat as the official
+            // api-request-trust.ts fence.
+            const method = req.method ?? '';
+            if (method !== 'POST') {
+                sendJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'POST only' } });
+                return;
+            }
+            const contentType = String(req.headers?.['content-type'] ?? '').toLowerCase();
+            if (!contentType.includes('application/json')) {
+                sendJson(res, 415, { ok: false, error: { code: 'unsupported-media-type', message: 'application/json required' } });
+                return;
+            }
+            if (!isTrustedRequest(req)) {
+                sendJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'untrusted request' } });
+                return;
+            }
+            const body = (await readJsonBody(req));
+            switch (op) {
+                case 'listProfiles': {
+                    sendJson(res, 200, { ok: true, value: service.listProfiles() });
+                    return;
+                }
+                case 'list': {
+                    const profile = typeof body['profile'] === 'string' ? body['profile'] : '';
+                    sendJson(res, 200, { ok: true, value: service.list(profile) });
+                    return;
+                }
+                case 'setEnabled': {
+                    const profile = typeof body['profile'] === 'string' ? body['profile'] : '';
+                    const entryId = typeof body['entryId'] === 'string' ? body['entryId'] : '';
+                    const enabled = body['enabled'] === true;
+                    sendJson(res, 200, { ok: true, value: await service.setEnabled(profile, entryId, enabled) });
+                    return;
+                }
+                case 'install': {
+                    const profile = typeof body['profile'] === 'string' ? body['profile'] : '';
+                    const spec = typeof body['spec'] === 'string' ? body['spec'] : '';
+                    const rawAnswers = body['answers'];
+                    const answers = rawAnswers !== null && typeof rawAnswers === 'object' && !Array.isArray(rawAnswers)
+                        ? Object.fromEntries(Object.entries(rawAnswers).filter((entry) => typeof entry[1] === 'string'))
+                        : undefined;
+                    sendJson(res, 200, { ok: true, value: await service.install(profile, spec, answers, acceptLanguageLocale(String(req.headers?.['accept-language'] ?? ''))) });
+                    return;
+                }
+                case 'remove': {
+                    const profile = typeof body['profile'] === 'string' ? body['profile'] : '';
+                    const name = typeof body['name'] === 'string' ? body['name'] : '';
+                    sendJson(res, 200, { ok: true, value: await service.remove(profile, name) });
+                    return;
+                }
+                case 'uninstallKind': {
+                    const profile = typeof body['profile'] === 'string' ? body['profile'] : '';
+                    const repo = typeof body['repo'] === 'string' ? body['repo'] : '';
+                    sendJson(res, 200, { ok: true, value: await service.uninstallKind(profile, repo) });
+                    return;
+                }
+                case 'listKinds': {
+                    sendJson(res, 200, { ok: true, value: await service.listKinds() });
+                    return;
+                }
+                case 'backupExport': {
+                    const profile = typeof body['profile'] === 'string' ? body['profile'] : '';
+                    sendJson(res, 200, { ok: true, value: await service.backupExport(profile) });
+                    return;
+                }
+                case 'backupDiff': {
+                    const profile = typeof body['profile'] === 'string' ? body['profile'] : '';
+                    const backup = body['backup'];
+                    if (backup === undefined || typeof backup !== 'object' || !Array.isArray(backup.profiles)) {
+                        sendJson(res, 400, { ok: false, error: { code: 'bad-backup', message: 'backup payload is not a valid backup file' } });
+                        return;
+                    }
+                    sendJson(res, 200, { ok: true, value: await service.backupDiff(backup, profile) });
+                    return;
+                }
+                case 'backupRestore': {
+                    const profile = typeof body['profile'] === 'string' ? body['profile'] : '';
+                    const backup = body['backup'];
+                    if (backup === undefined || typeof backup !== 'object' || !Array.isArray(backup.profiles)) {
+                        sendJson(res, 400, { ok: false, error: { code: 'bad-backup', message: 'backup payload is not a valid backup file' } });
+                        return;
+                    }
+                    sendJson(res, 200, { ok: true, value: await service.backupRestore(backup, profile) });
+                    return;
+                }
+                case 'unblockRepo': {
+                    const repo = typeof body['repo'] === 'string' ? body['repo'] : '';
+                    const key = normalizeRepoRef(repo);
+                    if (key === null) {
+                        sendJson(res, 200, { ok: true, value: { ok: false, message: 'invalid repo: ' + repo } });
+                        return;
+                    }
+                    await removeBlockedRepo(key);
+                    sendJson(res, 200, { ok: true, value: { ok: true, message: 'unblocked ' + key } });
+                    return;
+                }
+                case 'createProfile': {
+                    const name = typeof body['name'] === 'string' ? body['name'] : '';
+                    const template = typeof body['template'] === 'string' ? body['template'] : 'web';
+                    sendJson(res, 200, { ok: true, value: await service.createProfile(name, template) });
+                    return;
+                }
+                case 'stopProfile': {
+                    const name = typeof body['name'] === 'string' ? body['name'] : '';
+                    sendJson(res, 200, { ok: true, value: await service.stopProfile(name) });
+                    return;
+                }
+                case 'marketplace': {
+                    const profile = typeof body['profile'] === 'string' ? body['profile'] : '';
+                    const refresh = body['refresh'] === true;
+                    sendJson(res, 200, { ok: true, value: await service.marketplace(profile, refresh) });
+                    return;
+                }
+                case 'startProfile': {
+                    const name = typeof body['name'] === 'string' ? body['name'] : '';
+                    sendJson(res, 200, { ok: true, value: await service.startProfile(name) });
+                    return;
+                }
+                case 'copyPlugins': {
+                    const from = typeof body['from'] === 'string' ? body['from'] : '';
+                    const to = typeof body['to'] === 'string' ? body['to'] : '';
+                    const names = Array.isArray(body['names']) ? body['names'] : [];
+                    sendJson(res, 200, { ok: true, value: await service.copyPlugins(from, to, names) });
+                    return;
+                }
+                case 'renameProfile': {
+                    const oldName = typeof body['oldName'] === 'string' ? body['oldName'] : '';
+                    const newName = typeof body['newName'] === 'string' ? body['newName'] : '';
+                    sendJson(res, 200, { ok: true, value: service.renameProfile(oldName, newName) });
+                    return;
+                }
+                case 'removeProfile': {
+                    const name = typeof body['name'] === 'string' ? body['name'] : '';
+                    sendJson(res, 200, { ok: true, value: service.removeProfile(name) });
+                    return;
+                }
+                case 'removeInsert': {
+                    const profile = typeof body['profile'] === 'string' ? body['profile'] : '';
+                    const rowId = typeof body['rowId'] === 'string' ? body['rowId'] : '';
+                    sendJson(res, 200, { ok: true, value: await service.removeInsert(profile, rowId) });
+                    return;
+                }
+                case 'mount': {
+                    const profile = typeof body['profile'] === 'string' ? body['profile'] : '';
+                    const packageName = typeof body['packageName'] === 'string' ? body['packageName'] : '';
+                    sendJson(res, 200, { ok: true, value: await service.mount(profile, packageName) });
+                    return;
+                }
+                case 'checkUpdates': {
+                    const profile = typeof body['profile'] === 'string' ? body['profile'] : '';
+                    sendJson(res, 200, { ok: true, value: await service.checkUpdates(profile) });
+                    return;
+                }
+                case 'analyze': {
+                    const profile = typeof body['profile'] === 'string' ? body['profile'] : '';
+                    sendJson(res, 200, { ok: true, value: service.analyze(profile) });
+                    return;
+                }
+                case 'fixIssue': {
+                    const profile = typeof body['profile'] === 'string' ? body['profile'] : '';
+                    const action = typeof body['action'] === 'string' ? body['action'] : '';
+                    const target = typeof body['target'] === 'string' ? body['target'] : '';
+                    sendJson(res, 200, { ok: true, value: await service.fixIssue(profile, action, target) });
+                    return;
+                }
+                case 'fixAll': {
+                    const profile = typeof body['profile'] === 'string' ? body['profile'] : '';
+                    sendJson(res, 200, { ok: true, value: await service.fixAll(profile) });
+                    return;
+                }
+                case 'update': {
+                    const profile = typeof body['profile'] === 'string' ? body['profile'] : '';
+                    const name = typeof body['name'] === 'string' ? body['name'] : '';
+                    sendJson(res, 200, { ok: true, value: await service.update(profile, name, acceptLanguageLocale(String(req.headers?.['accept-language'] ?? ''))) });
+                    return;
+                }
+                default:
+                    sendJson(res, 404, { ok: false, error: { code: 'unknown-op', message: op } });
+            }
+        }
+        catch (error) {
+            sendJson(res, 400, {
+                ok: false,
+                error: { code: 'bad-request', message: error instanceof Error ? error.message : String(error) },
+            });
+        }
+    };
+    const disposers = [];
+    for (const op of ['listProfiles', 'list', 'setEnabled', 'install', 'remove', 'uninstallKind', 'listKinds', 'unblockRepo', 'backupExport', 'backupDiff', 'backupRestore', 'removeInsert', 'mount', 'createProfile', 'renameProfile', 'removeProfile', 'copyPlugins', 'startProfile', 'stopProfile', 'marketplace', 'checkUpdates', 'update', 'analyze', 'fixIssue', 'fixAll']) {
+        disposers.push(webServer.register({ kind: 'exact', path: `${ROUTE_PREFIX}/${op}`, handler: handler(op) }));
+    }
+    return disposers;
+}
+export const Config = z.object({
+    profile: z.string().default('web'),
+});
+/** Plugin entry: mount the service, routes, and (when present) agent tools. */
+export const name = 'plugin-manager';
+export const inject = ['loader'];
+export function apply(ctx, config) {
+    const service = new PluginManagerService(ctx);
+    // Plugin-owned watcher for the running profile's patch file: manual edits
+    // keep applying live even after a toggle unloads the platform HMR service
+    // (its own patch watcher is an effect of HMR and does not come back).
+    const host = hostProfileName();
+    if (host !== null) {
+        ensurePatchWatcher(ctx, patchPath(profileDir(host)));
+    }
+    // webServer is a sibling include-group row; ctx.inject waits for it like
+    // the official agent-tool-presentation waits for codeRuntime.
+    ctx.inject(['webServer'], (webCtx) => {
+        webCtx.effect(() => {
+            const disposers = registerRoutes(webCtx, service);
+            return () => { for (const dispose of disposers)
+                dispose(); };
+        }, 'dsh-web-plugin-manager: routes');
+    });
+    // V2-E: agent tools + install guard, when the host provides the tools
+    // service (web profiles do; headless may not — inject simply never fires).
+    // The guard denies raw dsh plugin/pnpm mutations from the agent so every
+    // install goes through the protected flow (quality gate + rollback).
+    ctx.inject(['tools'], (toolsCtx) => {
+        toolsCtx.effect(() => {
+            // Parameter-order adapter: the service takes (profile, refresh), the
+            // tool host takes (refresh, profile).
+            const disposers = registerTools(toolsCtx, {
+                list: (profile) => service.list(profile),
+                setEnabled: (profile, entryId, enabled) => service.setEnabled(profile, entryId, enabled),
+                install: (profile, spec) => service.install(profile, spec),
+                remove: (profile, name) => service.remove(profile, name),
+                removeInsert: (profile, rowId) => service.removeInsert(profile, rowId),
+                marketplace: (refresh, profile) => service.marketplace(profile, refresh),
+            }, config.profile);
+            const guardDisposer = registerPluginGuard(toolsCtx);
+            if (guardDisposer !== null)
+                disposers.push(guardDisposer);
+            return () => { for (const dispose of disposers)
+                dispose(); };
+        }, 'dsh-web-plugin-manager: tools');
+    });
+    // V2-E: the install-rule prompt section, so the model prefers the
+    // protected surface before it attempts the raw path.
+    ctx.inject(['systemPrompt'], (promptCtx) => {
+        promptCtx.effect(() => {
+            const sectionDisposer = registerPluginRulePrompt(promptCtx);
+            return () => { if (sectionDisposer !== null)
+                sectionDisposer(); };
+        }, 'dsh-web-plugin-manager: prompt rule');
+    });
+}
+// Function-plugin form: no default export (mixing forms makes the Loader
+// discard the named apply). The service class is instantiated inside apply.

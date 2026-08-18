@@ -16,21 +16,23 @@ DeepSeek Harness (DSH) Web 插件安全网。一次安装聚合插件管理、�
 
 ## 聚合方式
 
-安全网采用组合 Bundle，而不是复制或改写上游源码：
+安全网采用组合 Bundle，并在仓库中保留上游源码与构建后的运行包：
 
 - 一次安装带入并挂载三个上游插件；
 - 三个模块共用 DSH 设置入口，但保留独立服务、路由和数据目录；
 - 插件管理器替代 DSH 原生只读插件列表，其他安全面板作为同一设置界面的独立分区；
-- 依赖直接来自上游 GitHub 仓库，便于审计来源和跟随安全更新；
+- 上游源码、构建产物和许可证随本仓库内置，安装时不解析嵌套 GitHub 依赖；
 - 卸载本聚合包即可移除组合挂载层，不修改 DSH 核心源码。
 
-这种隔离式聚合避免合并代码时产生服务名、路由、设置 section 和客户端模块注册冲突。
+这种隔离式聚合避免合并代码时产生服务名、路由、设置 section 和客户端模块注册冲突。每次升级上游时都应重新构建、测试并更新 `bundled/`。
 
 ## 安装
 
 ```bash
-dsh plugin --profile web add github:baihejiangnan/dsh-plugin-safety-net
+dsh plugin --profile web add https://raw.githubusercontent.com/baihejiangnan/dsh-plugin-safety-net/master/dist/dsh-plugin-safety-net-0.1.0.tgz
 ```
+
+请使用上面的发布 tarball。直接使用 `github:baihejiangnan/dsh-plugin-safety-net` 会让包管理器按源码依赖处理，无法保证 bundled dependencies 的安装语义。
 
 安装完成后重启 `dsh web`，然后在设置中使用：
 
@@ -46,6 +48,12 @@ dsh plugin --profile web add github:baihejiangnan/dsh-plugin-safety-net
 - 不应同时单独挂载这三个上游插件，否则可能出现重复 Loader 条目或重复设置面板。
 - 上游插件仍由各自作者维护；升级前建议先创建快照并运行健康检查。
 - 聚合包不会绕过上游插件自身的确认步骤、安全边界或平台限制。
+
+## 仓库结构
+
+- `upstream-sources/`：固定上游提交的可审计源码、测试、文档和许可证；
+- `bundled/`：从固定提交构建并裁剪出的运行包；
+- `dist/`：可直接安装、内含三个运行包及其运行时依赖的发布 tarball。
 
 ## 致谢
 

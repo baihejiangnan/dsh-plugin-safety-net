@@ -1,0 +1,92 @@
+{
+  "name": "dsh-web-plugin-manager",
+  "version": "0.4.6",
+  "description": "Manage DeepSeek Harness (DSH) plugins from the Web UI: list, enable/disable, install/remove, environments, and a GitHub-awesome-driven marketplace.",
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "plugin",
+    "plugin-manager",
+    "marketplace"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LX2000WASD/dsh-web-plugin-manager.git"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./client": {
+      "types": "./dist/client/index.d.ts",
+      "default": "./dist/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "docs/feature-reference.md",
+    "README.en.md"
+  ],
+  "bin": {
+    "dshpm": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.host.json && tsc -p tsconfig.client.json && tsdown --config tsdown.client.config.ts",
+    "typecheck": "tsc --noEmit",
+    "prepare": "pnpm run build",
+    "build:host": "tsc -p tsconfig.host.json",
+    "build:client": "tsc -p tsconfig.client.json && tsdown --config tsdown.client.config.ts",
+    "test": "pnpm run build:host && node --test 'tests/*.test.mjs'"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "js-yaml": "^4.3.1"
+  },
+  "dependencies": {
+    "undici": "^7.29.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/cordis-plugin-loader": "^1.0.2",
+    "@deepseek-ai/dsh-client-locale": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-runtime": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.1.0-rc.7",
+    "@deepseek-ai/dsh-client-ui-settings": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-ui-slots": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "@deepseek-ai/dsh-host-webserver": "0.1.0-rc.7",
+    "js-yaml": "^4.3.1",
+    "@deepseek-ai/dsh-llm": "0.1.0-rc.7",
+    "@deepseek-ai/dsh-typert-protocol": "^0.1.0-rc.6",
+    "@types/node": "^22.0.0",
+    "@types/react": "^18.2.0",
+    "react": "^18.2.0",
+    "tsdown": "^0.22.2",
+    "typescript": "^5.6.0"
+  },
+  "license": "MIT"
+}

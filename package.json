@@ -8,7 +8,8 @@
     "cordis.patch.yml",
     "README.md",
     "LICENSE",
-    "pnpm-workspace.yaml"
+    "pnpm-workspace.yaml",
+    "bundled"
   ],
   "repository": {
     "type": "git",
@@ -20,10 +21,15 @@
     }
   },
   "dependencies": {
-    "dsh-plugin-guard": "https://codeload.github.com/lxzy-7/dsh-plugin-guard/tar.gz/c95036f33a2a10bb4c12d04a7f470747effe6532",
-    "dsh-plugin-healthcheck": "https://codeload.github.com/chenw2759-wq/dsh-plugin-healthcheck/tar.gz/0d29936305a1649a08625d70066d0c2c3ef1700b",
-    "dsh-web-plugin-manager": "https://codeload.github.com/LX2000WASD/dsh-web-plugin-manager/tar.gz/13fb7a705fb42ba28930f0700269831a665b12d8"
+    "dsh-plugin-guard": "file:bundled/dsh-plugin-guard",
+    "dsh-plugin-healthcheck": "file:bundled/dsh-plugin-healthcheck",
+    "dsh-web-plugin-manager": "file:bundled/dsh-web-plugin-manager"
   },
+  "bundledDependencies": [
+    "dsh-plugin-guard",
+    "dsh-plugin-healthcheck",
+    "dsh-web-plugin-manager"
+  ],
   "engines": {
     "node": ">=18"
   }

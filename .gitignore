@@ -1,4 +1,8 @@
 node_modules/
+vendor/
 .pnpm-store/
 dist/
+!dist/
+dist/*
+!dist/*.tgz
 *.log

@@ -1,11 +1,12 @@
 {
   "name": "dsh-plugin-safety-net",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Unified DSH plugin safety net with guarded installs, Web plugin management, and deep health checks.",
   "license": "MIT",
   "type": "module",
   "files": [
     "cordis.patch.yml",
+    "lib",
     "README.md",
     "LICENSE",
     "pnpm-workspace.yaml",
@@ -18,6 +19,9 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   },
   "dependencies": {
